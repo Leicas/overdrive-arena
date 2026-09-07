@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+# per-installation state
+track.json
+battery_log.csv
+# captures and scratch
+shots/
+*.log
+tests/*.png
