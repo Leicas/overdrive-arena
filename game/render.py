@@ -422,8 +422,8 @@ class Renderer:
 
         # header
         self.text("PAIRING", (28, 18), TEXT, self.title)
-        self.text("Every controller has a cursor. Move it onto a car and press A / Enter to drive that car. "
-                  "Cars nobody takes are driven by the AI (X / Tab switches a car between AI and parked).", (28, 60), DIM, self.small)
+        self.text("A / Enter claims a car; leave cars unclaimed for AI-only races. "
+                  "Cars nobody takes are driven by the AI (X / Tab cycles Easy / Normal / Hard / Extreme / Parked).", (28, 60), DIM, self.small)
 
         # car cards
         n = max(1, len(game.cars))
@@ -468,8 +468,8 @@ class Renderer:
             elif game.ai_enabled and c.ai_pref:
                 pygame.draw.rect(self.screen, (52, 56, 70), slot, border_radius=10)
                 self.text("AI", (slot.x + 12, slot.y + 10), TEXT, self.big)
-                self.text("computer drives this car", (slot.x + 52, slot.y + 14), DIM, self.small)
-                hint = "A/Enter: take it   X/Tab: park it"
+                self.text(f"{c.ai_difficulty.title()} · computer driver", (slot.x + 52, slot.y + 14), DIM, self.small)
+                hint = "A/Enter: take it   X/Tab: level / park"
             else:
                 pygame.draw.rect(self.screen, (44, 46, 56), slot, 2, border_radius=10)
                 self.text("PARKED", (slot.x + 12, slot.y + 10), FAINT, self.big)
@@ -508,7 +508,7 @@ class Renderer:
         # big buttons: RACE and SCAN TRACK (keyboard / pad shortcuts shown, also mouse-clickable)
         self.buttons = {}
         by = ly + 58
-        race_ok = bool(claims)
+        race_ok = game.can_start(claims.values())
         self.buttons["race"] = self.button(28, by, 240, 46, "RACE", "Start / Space",
                                            OK if race_ok else (60, 62, 74), enabled=race_ok)
         scan_car = next((c for c in game.cars if c.localized()), None)
@@ -524,7 +524,7 @@ class Renderer:
         self.buttons["laps"] = self.button(mx + 208, by, 84, 46, f"{game.lap_target}", "laps", (110, 112, 130) if race_mode else (70, 72, 84), enabled=race_mode)
         self.text("laps only, no weapons" if race_mode else "blasters, mines, kills", (mx, by + 52), FAINT, self.small)
         if not race_ok:
-            self.text("take a car (A / Enter) to enable", (28, by + 52), FAINT, self.small)
+            self.text("assign a player or AI off its charger", (28, by + 52), FAINT, self.small)
         if scan_car is not None:
             self.text("all cars drive one lap", (28 + 256, by + 52), FAINT, self.small)
 
@@ -627,6 +627,8 @@ class Renderer:
             cx = box.x + 52 + self.small.size(c.driver_label())[0] + 10
             if game.phase == "race" and game.wrong_way(c):
                 self.chip(cx, box.y + 33, "WRONG WAY", BAD)
+            elif c.grid_state == "missed start":
+                self.chip(cx, box.y + 33, "LEFT OUT (start missed)", WARN)
             elif c.grid_state == "off track":
                 self.chip(cx, box.y + 33, "LEFT OUT (off track)", WARN)
             elif c.grid_state == "charging" or (c.charging and not dead):
@@ -634,14 +636,18 @@ class Renderer:
             elif game.phase in ("grid", "countdown") and c.grid_state:
                 gs = c.grid_state
                 self.chip(cx, box.y + 33, {"driving": "TO THE GRID", "approach": "LINING UP", "placed": "ON THE LINE", "off track": "LEFT OUT (off track)",
-                                           "u-turn": "TURNING AROUND"}.get(gs, gs.upper()),
+                                           "u-turn": "TURNING AROUND", "retry lap": "RETRYING START"}.get(gs, gs.upper()),
                           OK if gs == "placed" else (WARN if gs == "off track" else (120, 120, 130)))
+            elif now < c.boost_until:
+                self.chip(cx, box.y + 33, "BOOST", OK)
             elif dead:
                 self.chip(cx, box.y + 33, "DESTROYED", BAD)
             elif now < c.stun_until:
                 self.chip(cx, box.y + 33, "STUNNED", WARN)
             elif now < c.penalty_until:
                 self.chip(cx, box.y + 33, "SLOWED", WARN)
+            elif c.ai_track_recovery:
+                self.chip(cx, box.y + 33, "FINDING TRACK" if c.ai_track_recovery == "searching" else "PUT BACK / R", WARN)
             elif not c.localized():
                 st = c.track_status()
                 self.chip(cx, box.y + 33, {"link lost": "LINK LOST", "off track": "OFF TRACK", "idle": "STOPPED", "charging": "ON CHARGER"}.get(st, st.upper()),
@@ -673,6 +679,9 @@ class Renderer:
             pygame.draw.rect(self.screen, (40, 40, 48), (bx, sy, bw - 90, 5), border_radius=2)
             pygame.draw.rect(self.screen, c.color, (bx, sy, int((bw - 90) * min(1.0, spd / max(1, c.max_speed))), 5), border_radius=2)
             self.text(f"{spd:>4} / {c.max_speed} mm/s", (bx, sy + 8), DIM, self.small)
+            pos_age = f"{max(0, now - c.loc.last_update):.1f}s" if c.loc and c.loc.index is not None else "--"
+            radio_age = f"{max(0, now - c.last_radio_t):.1f}s" if c.last_radio_t else "--"
+            self.text(f"P {pos_age}  BT {radio_age}", (bx + 150, sy + 8), DIM, self.small)
             for i, lane in enumerate(LANES_MM):
                 lx = box.right - 20 - (4 - i) * 18
                 on = abs(c.target_offset - lane) < 12

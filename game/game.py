@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+from queue import Empty, SimpleQueue
 import random
 import time
 from collections import deque
@@ -12,7 +13,7 @@ from typing import Optional
 
 from anki import protocol as P
 from anki.ble_worker import BleWorker
-from anki.track import CarLocalizer, Track
+from anki.track import CarLocalizer, Track, STRAIGHT, START, CRISSCROSS, TURN
 from anki.vehicle import Vehicle
 from . import inputs as I
 from .battery import BatteryMonitor
@@ -56,7 +57,13 @@ GRID_CRAWL = 200            # final approach speed: slow and identical for every
 GRID_TIMEOUT_S = 12.0       # a car that reads no codes for this long is not on the track
 GRID_STOP_FRAC = 0.24       # stop once this far into the start piece (before the finish line at 0.5)
 COUNTDOWN_S = 3.0
+BOOST_DURATION_S = 0.6
+BOOST_COOLDOWN_S = 6.0
 BATTERY_LOG = Path(__file__).resolve().parents[1] / "battery_log.csv"
+
+# Multipliers of --ai-speed: straight speed, curve speed, weapon reaction rate.
+AI_LEVELS = {"easy": (0.8, 0.65, 0.5), "normal": (1.0, 0.85, 1.0), "hard": (1.25, 1.05, 1.5),
+             "extreme": (1.25, 1.25, 2.0)}
 
 
 @dataclass
@@ -101,12 +108,17 @@ class CarState:
         self.color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
         self.engine_rgb = ENGINE_COLORS[index % len(ENGINE_COLORS)]
         self.ble = ble
-        self.max_speed = max_speed
+        self._ai_max_speed = max_speed
+        self.player_max_speed = 2000
         self.source: Optional[I.InputSource] = None
         self.ai = False
         self.ai_pref = True                 # pairing screen: unclaimed car -> AI (True) or parked (False)
+        self.ai_difficulty = "normal"
         self.loc: Optional[CarLocalizer] = None
         self.extra_listener = None          # e.g. the track scanner while scanning
+        self._messages = SimpleQueue()
+        self.last_radio_t = 0.0
+        self.message_delay_s = 0.0
         self.battery = BatteryMonitor(car.model, BATTERY_LOG)
         if car.battery_mv:
             self.battery.update(car.battery_mv, 0)
@@ -115,12 +127,20 @@ class CarState:
         self.grid_t0 = 0.0
         self.grid_uturn_t = 0.0
         self.grid_laps = 0
+        self.grid_retry_lap = False
+        self.grid_prev_index: Optional[int] = None
         self.laps = 0
         self.lap_start_t: Optional[float] = None
         self.last_lap_s: Optional[float] = None
         self.best_lap_s: Optional[float] = None
         self._prev_progress: Optional[float] = None
-        self._lap_armed = True             # re-armed once the car is well past the start piece
+        self._lap_travel = 0.0             # net forward progress since a clean line crossing
+        self._reverse_reports = 0         # BLE-thread counter: do not lose brief reversals between frames
+        self._lap_reverse_seen = 0
+        self._offtrack_reports = 0
+        self._last_offtrack_t = 0.0
+        self._lap_offtrack_seen = 0
+        self._ai_offtrack_seen = 0
 
         self.hp = MAX_HP
         self.kills = 0
@@ -134,6 +154,28 @@ class CarState:
         self.mine_ready_at = 0.0
         self.ai_next_lane_t = 0.0
         self.ai_uturn_t = 0.0
+        self.ai_telemetry_t = 0.0
+        self.extreme_max_speed: Optional[float] = None
+        self.ai_corner_radius = 0.0
+        self.ai_last_corner_radius = 0.0
+        self.ai_curve_test_limit = 0.0
+        self.ai_corner_limit: Optional[float] = None
+        self.ai_last_corner_speed = 0.0
+        self.ai_last_corner_t = 0.0
+        self.ai_recovering = False
+        self.ai_forward_since: Optional[float] = None
+        self.ai_has_driven = False
+        self.ai_reverse_seen = 0
+        self.ai_clean_corners = 0
+        self.ai_learning_piece: Optional[int] = None
+        self.ai_curve_entry_seen = False
+        self.ai_curve_last_frac = 0.0
+        self.ai_curve_test_speed = 0.0
+        self.ai_track_recovery = ""       # '', 'searching', 'waiting'
+        self.ai_track_recovery_t = 0.0
+        self.ai_manual_track_retry = False
+        self.boost_until = 0.0
+        self.boost_ready_at = 0.0
         self.lights_restore_at = 0.0
 
         self._last_speed_sent = 0
@@ -147,16 +189,65 @@ class CarState:
 
     # ---- identity ----
     @property
+    def max_speed(self) -> int:
+        if self.source is not None:
+            return self.player_max_speed
+        if self.ai_difficulty == "extreme" and self.extreme_max_speed is not None:
+            return int(self.extreme_max_speed)
+        return self._ai_max_speed
+
+    @max_speed.setter
+    def max_speed(self, value: int) -> None:
+        if self.source is not None:
+            self.player_max_speed = value
+        else:
+            self._ai_max_speed = value
+            if self.ai_difficulty == "extreme" and self.extreme_max_speed is not None:
+                self.extreme_max_speed = value
+
+    @property
     def name(self) -> str:
         return self.car.model
 
     def driver_label(self) -> str:
         if self.source is not None:
             return f"{self.source.short} · {self.source.name}"
-        return "AI" if self.ai else "parked"
+        if self.ai:
+            learned = f" · turns {self.ai_corner_limit:.0f}" if self.ai_corner_limit is not None else ""
+            return f"AI · {self.ai_difficulty.title()}{learned}"
+        return "parked"
 
-    # ---- messages (BLE thread) ----
-    def on_message(self, msg_id: int, decoded) -> None:
+    def cycle_ai(self) -> None:
+        """Pairing selection: parked -> easy -> normal -> hard -> extreme -> parked."""
+        if not self.ai_pref:
+            self.ai_pref, self.ai_difficulty = True, "easy"
+        elif self.ai_difficulty == "extreme":
+            self.ai_pref = False
+        else:
+            levels = list(AI_LEVELS)
+            self.ai_difficulty = levels[levels.index(self.ai_difficulty) + 1]
+
+    # ---- messages (enqueue on BLE thread, apply on game thread) ----
+    def enqueue_message(self, msg_id: int, decoded) -> None:
+        received = time.monotonic()
+        self.last_radio_t = received
+        self._messages.put((msg_id, decoded, received))
+
+    def drain_messages(self) -> None:
+        for _ in range(256):
+            try:
+                msg_id, decoded, received = self._messages.get_nowait()
+            except Empty:
+                break
+            self.message_delay_s = max(0.0, time.monotonic() - received)
+            self.on_message(msg_id, decoded, received)
+
+    def on_message(self, msg_id: int, decoded, received_at: Optional[float] = None) -> None:
+        received_at = time.monotonic() if received_at is None else received_at
+        self.last_radio_t = max(self.last_radio_t, received_at)
+        if msg_id == P.MSG_VEHICLE_DELOCALIZED:
+            self._offtrack_reports += 1
+            self._last_offtrack_t = received_at
         if msg_id == P.MSG_BATTERY_LEVEL_RESPONSE and isinstance(decoded, dict):
             self.battery.update(int(decoded["battery_mv"]), self._last_speed_sent, charging=bool(self.car.on_charger))
         elif msg_id == P.MSG_STATUS_UPDATE and isinstance(decoded, P.VehicleStatus):
@@ -166,12 +257,19 @@ class CarState:
         elif msg_id == P.MSG_SPEED_UPDATE and isinstance(decoded, P.SpeedUpdate) and self.loc is not None:
             self.loc.speed = float(decoded.actual_mm_s)
         if self.loc is not None:
-            self.loc.on_message(msg_id, decoded)
+            self.loc.on_message(msg_id, decoded, received_at=received_at)
+            if msg_id == P.MSG_LOCALIZATION_POSITION_UPDATE and self.loc.direction < 0:
+                self._reverse_reports += 1
         if self.extra_listener is not None:
             self.extra_listener(msg_id, decoded)
 
     def set_track(self, track: Optional[Track]) -> None:
         self.loc = CarLocalizer(track) if track else None
+        self.ai_corner_limit = None
+        self.ai_corner_radius = self.ai_last_corner_radius = 0.0
+        self.ai_last_corner_t = 0.0
+        self.ai_clean_corners = 0
+        self.ai_learning_piece = None
 
     @property
     def charging(self) -> bool:
@@ -315,7 +413,7 @@ class CarState:
 
 
 class Game:
-    def __init__(self, ble: BleWorker, cars: list[CarState], track: Optional[Track], ai_enabled: bool, ai_speed: int):
+    def __init__(self, ble: BleWorker, cars: list[CarState], track: Optional[Track], ai_enabled: bool, ai_speed: Optional[int]):
         self.ble = ble
         self.cars = cars
         self.track = track
@@ -348,6 +446,10 @@ class Game:
         for c in self.cars:
             c.ai = self.ai_enabled and c.source is None and c.ai_pref
 
+    def can_start(self, claimed_cars) -> bool:
+        return any(c.car.connected and not c.charging and
+                   (c in claimed_cars or (self.ai_enabled and c.ai_pref)) for c in self.cars)
+
     def begin_grid(self) -> None:
         """Send every participating car to the start line, one lane each."""
         now = time.monotonic()
@@ -372,6 +474,8 @@ class Game:
             c.grid_t0 = now
             c.grid_uturn_t = 0.0
             c.grid_laps = 0
+            c.grid_retry_lap = False
+            c.grid_prev_index = None
             c.set_lane(c.grid_lane, now)
             c._last_lane_sent = 999.0     # force a lane command once the car is localized
             c.command_speed(GRID_SPEED, now)
@@ -386,11 +490,17 @@ class Game:
         done = True
         for c in self.cars:
             st = c.grid_state
-            if st in ("", "placed", "off track", "charging"):
+            if st in ("", "placed", "off track", "charging", "missed start"):
                 if st == "placed":
                     c.command_speed(0, now)
                 continue
             done = False
+            grid_limit = max(40.0, 3 * sum(p.length_mm for p in self.track.pieces) / GRID_CRAWL + 10) if self.track else 40.0
+            if now - c.grid_t0 > grid_limit:
+                c.grid_state = "missed start"
+                c.hard_stop(now)
+                self.log(f"{c.name}: start-line attempts timed out; left out", WARN_COLOR)
+                continue
             if not c.car.connected:
                 c.grid_state = "off track"
                 continue
@@ -404,6 +514,8 @@ class Game:
                 continue
             loc = c.loc
             assert loc is not None
+            previous_index = c.grid_prev_index
+            c.grid_prev_index = loc.index
             if loc.direction < 0:
                 # driving the wrong way round: turn around, then keep going
                 if now - c.grid_uturn_t > 4.0:
@@ -411,6 +523,13 @@ class Game:
                     c.grid_uturn_t = now
                     c.grid_state = "u-turn"
                 c.command_speed(GRID_SPEED, now)
+                continue
+            if c.grid_retry_lap:
+                if loc.index != 0:
+                    c.grid_retry_lap = False
+                c.grid_state = "retry lap"
+                c.command_speed(GRID_SPEED, now)
+                c.apply_lane(now)
                 continue
             n = len(self.track.pieces) if self.track else 1
             lane_now = c.actual_lane()
@@ -428,20 +547,24 @@ class Game:
             # stop on the finish-line bar in the middle of the start piece: it is read in every lane at the
             # same spot and detected even at crawl speed (codes are missed often below ~250 mm/s). The same
             # event ends a lap, so the cars park exactly where a winner stops.
-            on_bar = c.grid_state == "approach" and loc.index == 0 and loc.sub_id == 33 and 0.5 <= loc.frac < 0.6
-            fallback = loc.index == 0 and loc.frac >= 0.8   # only if the finish-line bar was somehow missed
-            if on_bar or fallback:
-                if not in_lane and now - c.grid_t0 < GRID_TIMEOUT_S * 2 and c.grid_laps < 2:
-                    # wrong lane at the line: do another lap and try again
-                    c.grid_laps += 1
-                    self.log(f"{c.name} reached the line in lane {lane_now if lane_now is None else round(lane_now):+}, wants {c.grid_lane:+.0f} - one more lap", c.color)
-                    c._last_lane_sent = 999.0
-                    c.grid_t0 = now
-                else:
+            on_bar = loc.index == 0 and loc.sub_id == 33 and 0.5 <= loc.frac < 0.6
+            overshot = (loc.index == 0 and loc.frac >= 0.6) or (previous_index == 0 and loc.index != 0)
+            if on_bar and in_lane:
+                c.hard_stop(now)
+                c.grid_state = "placed"
+                self.log(f"{c.name} on the start line (lane {lane_now:+.0f})", c.color)
+            elif on_bar or overshot:
+                c.grid_laps += 1
+                if c.grid_laps >= 3:
                     c.hard_stop(now)
-                    c.grid_state = "placed"
-                    how = "on the finish-line bar" if on_bar else f"by dead reckoning at {loc.frac:.2f}"
-                    self.log(f"{c.name} on the start line {how} (lane {lane_now if lane_now is None else round(lane_now):+} / {c.grid_lane:+.0f})", c.color)
+                    c.grid_state = "missed start"
+                    self.log(f"{c.name}: missed the start after 3 attempts; left out", WARN_COLOR)
+                else:
+                    c.grid_retry_lap = True
+                    c.grid_state = "retry lap"
+                    c._last_lane_sent = 999.0
+                    c.command_speed(GRID_SPEED, now)
+                    self.log(f"{c.name}: {'overshot' if overshot else 'wrong lane'}; another lap to retry the start", c.color)
         return done
 
     def grid_summary(self) -> tuple[int, int]:
@@ -486,14 +609,29 @@ class Game:
             c.last_lap_s = c.best_lap_s = None
             c.lap_start_t = None
             c._prev_progress = None
-            c._lap_armed = True
+            c._lap_travel = 0.0
+            c._lap_reverse_seen = c.ai_reverse_seen = c._reverse_reports
+            c._lap_offtrack_seen = c._ai_offtrack_seen = c._offtrack_reports
+            c.ai_recovering = c.ai_has_driven = False
+            c.ai_forward_since = None
+            c.ai_last_corner_t = c.ai_last_corner_speed = 0.0
+            c.ai_clean_corners = 0
+            c.ai_learning_piece = None
+            c.ai_track_recovery = ""
+            c.boost_until = 0.0
+            c.boost_ready_at = now + 3.0
+            if (c.grid_state == "placed" and c.localized() and c.loc is not None
+                    and c.loc.direction > 0 and c.loc.index == 0 and 0.5 <= c.loc.frac < 0.6):
+                # A car correctly parked on the bar starts its first timed lap at GO.
+                c.lap_start_t = now
+                c._prev_progress = c.loc.progress()
             c.dead_until = c.stun_until = c.penalty_until = 0.0
-            if c.grid_state in ("off track", "charging"):
+            if c.grid_state in ("off track", "charging", "missed start"):
                 c.ai = False
                 c.source = None
             elif not c.grid_state:
                 c.ai = self.ai_enabled and c.source is None and c.ai_pref
-            c.ai_next_lane_t = now + random.uniform(3, 6)
+            c.ai_next_lane_t = now + (0.35 if c.ai_difficulty == "extreme" else random.uniform(3, 6))
             c.lights_idle()
         self.log("race started")
 
@@ -524,21 +662,31 @@ class Game:
         return sorted(self.cars, key=lambda c: (-c.kills, c.deaths, -c.laps, c.index))
 
     def _track_laps(self, c: CarState, now: float) -> None:
-        """Count forward crossings of the finish line (middle of the start piece, progress 0.5)."""
-        if not c.localized():
+        """Only credit a complete forward circuit between clean finish-line crossings."""
+        reversed_since_tick = c._reverse_reports != c._lap_reverse_seen
+        c._lap_reverse_seen = c._reverse_reports
+        offtrack_since_tick = c._offtrack_reports != c._lap_offtrack_seen
+        c._lap_offtrack_seen = c._offtrack_reports
+        if not c.localized() or c.ai_track_recovery or self.wrong_way(c) or reversed_since_tick or offtrack_since_tick:
             c._prev_progress = None
+            c._lap_travel = 0.0
+            c.lap_start_t = None
             return
         p = c.loc.progress()  # type: ignore[union-attr]
         prev = c._prev_progress
         c._prev_progress = p
-        if p is None or prev is None or c.loc.direction < 0:  # type: ignore[union-attr]
+        if p is None or prev is None:
             return
         n = len(self.track.pieces) if self.track else 1
-        if 1.5 <= p <= n - 0.5:
-            c._lap_armed = True   # clearly away from the start piece: the next crossing is a real one
-        if c._lap_armed and prev < 0.5 <= p and p - prev < 0.6:
-            c._lap_armed = False
-            if c.lap_start_t is not None:
+        delta = (p - prev + n / 2) % n - n / 2
+        if abs(delta) > 1.25:
+            # Relocalization/teleport is not proof that the skipped track was driven.
+            c.lap_start_t = None
+            c._lap_travel = 0.0
+            return
+        c._lap_travel += delta
+        if prev < 0.5 <= p and p - prev < 0.6:
+            if c.lap_start_t is not None and c._lap_travel >= n - 0.25:
                 lap = now - c.lap_start_t
                 if lap > 2.0:
                     c.laps += 1
@@ -554,6 +702,7 @@ class Game:
                         self.effect("boom", c.world(), c.color, 1.5)
                         self.log(f"{c.name} WINS the race!", c.color)
             c.lap_start_t = now
+            c._lap_travel = 0.0
 
     # ---- per frame ----
     def tick(self, dt: float) -> None:
@@ -589,7 +738,8 @@ class Game:
                 self._ai(c, dt, now)
             else:
                 c.command_speed(0, now)
-            c.apply_lane(now)
+            if not c.ai_track_recovery:
+                c.apply_lane(now)
         self._resolve_mines(now)
         self.lasers = [l for l in self.lasers if l.until > now]
         self.mines = [m for m in self.mines if now - m.placed_at < MINE_LIFE_S]
@@ -601,11 +751,17 @@ class Game:
             c.max_speed = min(2000, c.max_speed + 100)
         if src.pressed(I.LIMIT_DOWN):
             c.max_speed = max(200, c.max_speed - 100)
+        if src.pressed(I.BOOST):
+            self.request_boost(c, now)
         if src.pressed(I.STOP):
             c.hard_stop(now)
             src.rumble(0.8, 0.8, 150)
         else:
-            c.command_speed(src.throttle() * (1.0 - src.brake()) * c.max_speed, now)
+            cruise = src.throttle() * (1.0 - src.brake()) * c.max_speed
+            boosted = self.boost_target(c, cruise, now) if src.throttle() > 0.9 and src.brake() == 0 else cruise
+            if src.brake() > 0 or src.throttle() <= 0.9:
+                c.boost_until = 0.0
+            c.command_speed(boosted, now)
         c.steer(src.steer(), dt, now)
         if src.pressed(I.LANE_LEFT):
             c.snap_lane(-1, now)
@@ -619,24 +775,344 @@ class Game:
         if src.pressed(I.MINE):
             self.drop_mine(c, now)
 
+    def ai_speed_ceiling(self, c: CarState) -> float:
+        if c.ai_difficulty == "extreme" and c.extreme_max_speed is not None:
+            return min(2000, c.extreme_max_speed)
+        return c.max_speed
+
+    def learned_corner_speed(self, c: CarState, radius: float) -> float:
+        limit = c.ai_corner_limit if c.ai_corner_limit is not None else float("inf")
+        if c.ai_difficulty == "extreme" and c.ai_corner_radius > 0 and radius > 0:
+            limit *= math.sqrt(radius / c.ai_corner_radius)
+        return limit
+
+    def corner_radius(self, c: CarState, piece) -> float:
+        return max(1.0, min(piece.length_at(l) * 2 / math.pi
+                           for l in (c.loc.lane_mm, c.target_offset * c.loc.direction)))
+
+    def ai_target_speed(self, c: CarState, straight_override: Optional[float] = None) -> float:
+        straight_factor, curve_factor, _ = AI_LEVELS[c.ai_difficulty]
+        # Without an explicit override, Hard uses the full car limit; Normal
+        # and Easy use 80% and 64%. Do not silently cap every AI at 450 mm/s.
+        base = self.ai_speed if self.ai_speed is not None else self.ai_speed_ceiling(c) / AI_LEVELS["hard"][0]
+        straight = max(0, min(2000, self.ai_speed_ceiling(c), base * straight_factor))
+        curve = min(straight, max(0, base * curve_factor))
+        cruise_straight = straight
+        if straight_override is not None:
+            straight = max(straight, min(1500, straight_override))
+        if not c.localized() or not self.track or c.loc is None:
+            return min(curve, 300)
+        loc = c.loc
+        pieces = self.track.pieces
+        piece = pieces[loc.index]
+        # Unknown/special pieces use the conservative curve limit too.
+        fast_kinds = (STRAIGHT, START, CRISSCROSS)
+        def limit_for(p):
+            if p.kind in fast_kinds:
+                return straight
+            learned = c.ai_corner_limit if c.ai_corner_limit is not None else float("inf")
+            if c.ai_difficulty != "extreme":
+                return min(curve, learned)
+            if p.kind != TURN or p.turn not in ("L", "R"):
+                return min(curve, learned, 300)
+            # Calibratable lateral acceleration budget (mm/s²). A tighter lane
+            # needs a lower speed at high limits: a = v²/r. Include a pending move.
+            radius = self.corner_radius(c, p)
+            if c.ai_corner_radius > 0:
+                learned *= math.sqrt(radius / c.ai_corner_radius)
+            return min(cruise_straight, learned, math.sqrt(3200.0 * radius))
+
+        distance = (1.0 - loc.frac) * piece.length_at(loc.lane_mm)
+        target = limit_for(piece)
+        for step in range(1, len(pieces) + 1):
+            upcoming = pieces[(loc.index + step) % len(pieces)]
+            if upcoming.kind not in fast_kinds:
+                # Higher difficulty brakes later while retaining a telemetry margin.
+                margin = {"easy": 0.25, "normal": 0.18, "hard": 0.12, "extreme": 0.08}[c.ai_difficulty]
+                usable = max(0.0, distance - max(straight, loc.speed) * margin)
+                target = min(target, math.sqrt(limit_for(upcoming) ** 2 + 2 * ACCEL_DOWN * usable))
+            distance += min(upcoming.length_at(l) for l in
+                            (loc.lane_mm, c.target_offset * loc.direction))
+        return target
+
+    def _boost_clear(self, c: CarState, now: float) -> bool:
+        if (not c.localized() or not self.track or c.charging or c.ai_track_recovery or c.ai_recovering
+                or c.is_dead(now) or now < c.stun_until or now < c.penalty_until
+                or c.battery.status == "critical"):
+            return False
+        loc = c.loc
+        if (loc.direction < 0 or now - loc.last_update > 0.4 or loc.speed < 300
+                or self.track.pieces[loc.index].kind not in (STRAIGHT, START)
+                or abs(c.target_offset - loc.lane_mm) > 12):
+            return False
+        for other in self.cars:
+            if other is c or not other.localized():
+                continue
+            low, high = self._occupied_lanes(other)
+            gap = self._traffic_distance(c, other)
+            if low - 32 < loc.lane_mm < high + 32 and 0 <= gap < max(350, loc.speed * 0.6):
+                return False
+        return True
+
+    def request_boost(self, c: CarState, now: float) -> bool:
+        if not self.running or self.finished or now < c.boost_ready_at or not self._boost_clear(c, now):
+            return False
+        peak = min(1500, c.max_speed * 1.5)
+        if self.ai_target_speed(c, peak) <= c.max_speed + 40:
+            return False  # too little braking room to gain speed
+        c.boost_until = now + BOOST_DURATION_S
+        c.boost_ready_at = now + BOOST_COOLDOWN_S
+        self.log(f"{c.name}: straight boost (up to {peak:.0f} mm/s)", c.color)
+        return True
+
+    def boost_target(self, c: CarState, cruise: float, now: float) -> float:
+        if now >= c.boost_until:
+            return cruise
+        if not self._boost_clear(c, now):
+            c.boost_until = 0.0
+            return cruise
+        return max(cruise, self.ai_target_speed(c, min(1500, c.max_speed * 1.5)))
+
+    def _traffic_distance(self, c: CarState, other: CarState) -> float:
+        """Signed centerline distance, wrapping at the finish line."""
+        pieces = self.track.pieces
+        def position(loc):
+            return sum(p.length_mm for p in pieces[:loc.index]) + loc.frac * pieces[loc.index].length_mm
+        length = sum(p.length_mm for p in pieces)
+        return (position(other.loc) - position(c.loc) + length / 2) % length - length / 2
+
+    @staticmethod
+    def _occupied_lanes(c: CarState) -> tuple[float, float]:
+        """Include the entire lane-change path, reserving a pending AI move."""
+        lane = c.loc.lane_mm
+        goal = c.target_offset * c.loc.direction
+        return min(lane, goal), max(lane, goal)
+
+    def ai_race_traffic(self, c: CarState, target: float, now: float) -> float:
+        if not c.localized() or not self.track or c.loc is None:
+            return target
+        traffic = [o for o in self.cars if o is not c and o.localized()]
+        lane = c.loc.lane_mm
+        low, high = self._occupied_lanes(c)
+        blockers = []
+        for other in traffic:
+            olo, ohi = self._occupied_lanes(other)
+            gap = self._traffic_distance(c, other)
+            if 0 <= gap < max(400, target * 1.2) and low < ohi + 32 and high > olo - 32:
+                blockers.append((gap, other))
+        piece = self.track.pieces[c.loc.index]
+        settled = abs(c.target_offset - lane) < 12
+        if (settled and now >= c.ai_next_lane_t and piece.kind in (STRAIGHT, START, CRISSCROSS)
+                and c.loc.frac < 0.6):
+            # Score the next three pieces by travel distance, including the move.
+            # Adjacent moves converge toward the inside without sweeping across lanes.
+            upcoming = [self.track.pieces[(c.loc.index + step) % len(self.track.pieces)]
+                        for step in range(1, min(3, len(self.track.pieces) - 1) + 1)]
+            def path_cost(candidate):
+                return sum(p.length_at(candidate) for p in upcoming) + abs(candidate - lane) * 0.2
+            candidates = sorted((l for l in LANES if 15 < abs(l - lane) <= 55), key=path_cost)
+            for candidate in candidates:
+                if not blockers and path_cost(candidate) >= path_cost(lane) - 10:
+                    continue
+                safe = True
+                path_low, path_high = sorted((lane, candidate))
+                for other in traffic:
+                    olo, ohi = self._occupied_lanes(other)
+                    if path_low >= ohi + 32 or path_high <= olo - 32:
+                        continue
+                    distance = self._traffic_distance(c, other)
+                    relative = other.loc.speed * other.loc.direction - c.loc.speed
+                    future = distance + relative * 0.8
+                    if min(distance, future) < 180 and max(distance, future) > -180:
+                        safe = False
+                        break
+                if safe:
+                    c.set_lane(candidate, now)
+                    c.ai_next_lane_t = now + (0.35 if c.ai_difficulty == "extreme" else 1.2)
+                    log.debug("AI %s %s: lane %.0f -> %.0f", c.name,
+                              "passing" if blockers else "shorter line", lane, candidate)
+                    break
+        if not blockers:
+            return target
+        gap, lead = min(blockers, key=lambda item: item[0])
+        # Follow until telemetry confirms lateral clearance, even after requesting a pass.
+        lead_speed = max(0.0, lead.loc.speed * lead.loc.direction)
+        usable = max(0.0, gap - 160 - max(c.loc.speed, target) * 0.3)
+        following = math.sqrt(lead_speed ** 2 + 2 * ACCEL_DOWN * usable)
+        if gap < 160:
+            following = min(following, lead_speed * max(0.0, gap - 80) / 80)
+        return min(target, following)
+
+    def _learn_corner_recovery(self, c: CarState, now: float) -> None:
+        """One reduction per spin, not per repeated U-turn command."""
+        reversal = self.wrong_way(c) or c._reverse_reports != c.ai_reverse_seen
+        c.ai_reverse_seen = c._reverse_reports
+        if reversal:
+            c.ai_forward_since = None
+            if not c.ai_recovering and c.ai_has_driven:
+                reference = (c.ai_last_corner_speed if now - c.ai_last_corner_t < 3.0
+                             else max(c.speed_sent(), 300))
+                if c.ai_corner_limit is not None:
+                    reference = min(reference, self.learned_corner_speed(c, c.ai_last_corner_radius))
+                c.ai_corner_limit = min(reference, max(200.0, reference * 0.85))
+                c.ai_corner_radius = c.ai_last_corner_radius
+                c.ai_clean_corners = 0
+                self.log(f"{c.name} learned: corners limited to {c.ai_corner_limit:.0f} mm/s after spin", c.color)
+            c.ai_recovering = True
+        elif c.localized():
+            if c.ai_forward_since is None:
+                c.ai_forward_since = now
+            if now - c.ai_forward_since >= 2.0:
+                c.ai_recovering = False
+            if c.speed_sent() > 0:
+                c.ai_has_driven = True
+        else:
+            c.ai_forward_since = None
+
+    def _learn_clean_corner(self, c: CarState, now: float) -> None:
+        """Probe upward slowly after three fully observed, forward, clean turns."""
+        if not c.localized() or c.ai_recovering or self.wrong_way(c) or not self.track:
+            c.ai_learning_piece = None
+            c.ai_clean_corners = 0
+            return
+        loc = c.loc
+        index = loc.index
+        previous = c.ai_learning_piece
+        if previous != index:
+            if (previous is not None and self.track.pieces[previous].kind == TURN
+                    and c.ai_curve_entry_seen and c.ai_curve_last_frac >= 0.65
+                    and c.ai_curve_test_speed >= c.ai_curve_test_limit * 0.9
+                    and index == (previous + 1) % len(self.track.pieces)):
+                c.ai_clean_corners += 1
+                if c.ai_clean_corners >= 3 and c.ai_corner_limit is not None:
+                    base = self.ai_speed if self.ai_speed is not None else self.ai_speed_ceiling(c) / AI_LEVELS["hard"][0]
+                    ceiling = min(2000, self.ai_speed_ceiling(c), base * AI_LEVELS[c.ai_difficulty][1])
+                    if c.ai_difficulty == "extreme" and c.ai_corner_radius > 0:
+                        ceiling = min(ceiling, math.sqrt(3200 * c.ai_corner_radius))
+                    old = c.ai_corner_limit
+                    raised = min(ceiling, old * 1.02)
+                    if raised > old:
+                        c.ai_corner_limit = raised
+                        self.log(f"{c.name} learned: trying {raised:.0f} mm/s in corners after 3 clean turns", c.color)
+                    c.ai_clean_corners = 0
+            elif previous is not None and index != (previous + 1) % len(self.track.pieces):
+                c.ai_clean_corners = 0
+            c.ai_learning_piece = index
+            c.ai_curve_entry_seen = self.track.pieces[index].kind == TURN and loc.frac <= 0.35
+            c.ai_curve_test_limit = c.ai_corner_limit or 0
+            if c.ai_difficulty == "extreme" and c.ai_corner_radius > 0:
+                c.ai_curve_test_limit *= math.sqrt(self.corner_radius(c, self.track.pieces[index]) / c.ai_corner_radius)
+            c.ai_curve_test_speed = min(loc.speed, c.speed_sent())
+        else:
+            c.ai_curve_test_speed = min(c.ai_curve_test_speed, loc.speed, c.speed_sent())
+        c.ai_curve_last_frac = loc.frac
+
+    def retry_ai_recovery(self) -> None:
+        """User has replaced a stopped car; allow one bounded attempt to read codes."""
+        if not self.running or self.finished or not self.track:
+            return
+        now = time.monotonic()
+        for c in self.cars:
+            if c.ai and c.ai_track_recovery == "waiting" and c.car.connected and not c.charging:
+                c.ai_track_recovery = "searching"
+                c.ai_track_recovery_t = now
+                c.ai_manual_track_retry = True
+                self.log(f"{c.name}: retrying track detection", c.color)
+
+    def _recover_ai_track(self, c: CarState, now: float) -> bool:
+        """Return True while normal driving must yield to track recovery."""
+        loc = c.loc
+        available = c.car.connected and not c.charging and loc is not None
+        reported = c._offtrack_reports != c._ai_offtrack_seen
+        c._ai_offtrack_seen = c._offtrack_reports
+        incident_t = c._last_offtrack_t if reported else (c.ai_track_recovery_t if c.ai_track_recovery else now)
+        if (available and (reported or not loc.on_track) and c.ai_has_driven and not c.ai_recovering
+                and 0 <= incident_t - c.ai_last_corner_t < 3.0 and c.ai_last_corner_speed > 0):
+            reference = min(c.ai_last_corner_speed, self.learned_corner_speed(c, c.ai_last_corner_radius))
+            c.ai_corner_limit = min(reference, max(200.0, reference * 0.85))
+            c.ai_corner_radius = c.ai_last_corner_radius
+            c.ai_recovering = True
+            c.ai_forward_since = None
+            c.ai_clean_corners = 0
+            self.log(f"{c.name} learned: corners limited to {c.ai_corner_limit:.0f} mm/s after leaving track", c.color)
+        fresh = available and loc.on_track and loc.index is not None and now - loc.last_update < 1.5
+        if fresh and (not c.ai_track_recovery or loc.last_update > c.ai_track_recovery_t):
+            if c.ai_track_recovery:
+                c.ai_track_recovery = ""
+                c.ai_forward_since = None
+                self.log(f"{c.name}: track found, resuming", c.color)
+            return False
+        if not c.ai_track_recovery:
+            c.ai_track_recovery_t = now
+            c.ai_manual_track_retry = False
+            # A positive delocalized report means stop; missing telemetry alone
+            # gets one 1.5 s search at 250 mm/s. Never keep driving blindly.
+            can_probe = available and loc.on_track and (c.speed_sent() > 0 or not c.ai_has_driven)
+            c.ai_track_recovery = "searching" if can_probe else "waiting"
+            c._prev_progress = c.lap_start_t = None
+            c._lap_travel = 0.0
+            c.ai_learning_piece = None
+            c.ai_clean_corners = 0
+            self.log(f"{c.name}: {'searching for track codes' if c.ai_track_recovery == 'searching' else 'put back on track, press R / right-stick click'}", WARN_COLOR)
+        if c.ai_track_recovery == "searching" and (not available or now - c.ai_track_recovery_t >= 1.5
+                                                  or (not loc.on_track and not c.ai_manual_track_retry)):
+            c.ai_track_recovery = "waiting"
+            self.log(f"{c.name}: stopped; put back on track, press R / right-stick click", WARN_COLOR)
+        if c.car.connected:
+            c.command_speed(min(250, c.max_speed) if c.ai_track_recovery == "searching" else 0, now)
+        else:
+            c._last_speed_sent = 0
+        return True
+
     def _ai(self, c: CarState, dt: float, now: float) -> None:
+        if self._recover_ai_track(c, now):
+            return
+        self._learn_corner_recovery(c, now)
+        self._learn_clean_corner(c, now)
         if self.wrong_way(c):
             # never race against the track direction: turn around (once every few seconds until it sticks)
             if now - c.ai_uturn_t > 4.0:
                 c.u_turn()
                 c.ai_uturn_t = now
                 self.log(f"{c.name} turns around (wrong way)", c.color)
-            c.command_speed(min(self.ai_speed, 300), now)
+            c.command_speed(min(self.ai_target_speed(c), 300), now)
             return
-        c.command_speed(self.ai_speed, now)
-        if now > c.ai_next_lane_t:
+        target = self.ai_target_speed(c)
+        if c.ai_difficulty in ("hard", "extreme"):
+            self.request_boost(c, now)
+        target = self.boost_target(c, target, now)
+        if self.mode == "race":
+            target = self.ai_race_traffic(c, target, now)
+            # A newly selected inside lane can have a tighter curve speed limit.
+            target = min(target, self.boost_target(c, self.ai_target_speed(c), now))
+        c.command_speed(target, now)
+        if (c.localized() and self.track and c.loc is not None
+                and self.track.pieces[c.loc.index].kind == TURN and not c.ai_recovering):
+            # Learn from the intended corner limit, not a traffic slowdown or
+            # motor overshoot that could otherwise raise the cap after a spin.
+            c.ai_last_corner_speed = self.ai_target_speed(c)
+            c.ai_last_corner_radius = self.corner_radius(c, self.track.pieces[c.loc.index])
+            c.ai_last_corner_t = now
+        if log.isEnabledFor(logging.DEBUG) and now >= c.ai_telemetry_t:
+            c.ai_telemetry_t = now + 0.25
+            loc = c.loc
+            log.debug("AI %s %s target=%d actual=%.0f limit=%d piece=%s frac=%.2f pos_age=%.2f radio_age=%.2f queue_delay=%.3f",
+                      c.name, c.ai_difficulty, c.speed_sent(), loc.speed if loc else 0,
+                      c.max_speed, self.track.pieces[loc.index].kind
+                      if self.track and loc and loc.index is not None else "unknown", loc.frac if loc else 0,
+                      now - loc.last_update if loc else -1, now - c.last_radio_t if c.last_radio_t else -1,
+                      c.message_delay_s)
+        on_straight = (c.localized() and c.loc is not None and self.track is not None
+                       and self.track.pieces[c.loc.index].kind in (STRAIGHT, START, CRISSCROSS))
+        if self.mode != "race" and on_straight and now > c.ai_next_lane_t:
             c.set_lane(random.choice(LANES), now)
             c.ai_next_lane_t = now + random.uniform(4, 9)
         if not self.weapons_enabled:
             return
-        if now > c.fire_ready_at and random.random() < dt * 0.6 and self.target_ahead(c) is not None:
+        reaction = AI_LEVELS[c.ai_difficulty][2]
+        if now > c.fire_ready_at and random.random() < dt * 0.6 * reaction and self.target_ahead(c) is not None:
             self.fire(c, now)
-        if now > c.mine_ready_at and random.random() < dt * 0.06:
+        if now > c.mine_ready_at and random.random() < dt * 0.06 * reaction:
             self.drop_mine(c, now)
 
     # ---- weapons ----

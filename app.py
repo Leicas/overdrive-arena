@@ -45,10 +45,10 @@ SCAN_NO_DATA_S = 8.0
 
 PAIRING, SCANNING, GRID, COUNTDOWN, RACE = "pairing", "scanning", "grid", "countdown", "race"
 
-CONTROLS_PAIRING = ("pad:  D-pad/stick move   A take car   B release   X AI/parked   Y scan track   stick-click mode   Start RACE   Back quit\n"
-                    "keys: Left/Right move   Enter take car   Backspace release   Tab AI/parked   T scan track   M mode   Space RACE   Esc quit")
-CONTROLS_RACE = ("pad: RT gas  LT brake  stick/LB/RB lanes  X fire  Y mine  A u-turn  B stop  D-pad up/down limit  Back pairing\n"
-                 "key: W/S gas/brake  A/D steer  Q/E lanes  F fire  G mine  U u-turn  Space stop  +/- limit  Esc pairing  F11 fullscreen")
+CONTROLS_PAIRING = ("pad:  D-pad/stick move   A take car   B release   X AI level/park   Y scan track   stick-click mode   Start RACE   Back quit\n"
+                    "keys: Left/Right move   Enter take car   Backspace release   Tab AI level/park   T scan track   M mode   Space RACE   Esc quit")
+CONTROLS_RACE = ("pad: RT gas  LT brake  stick/LB/RB lanes  X fire  Y mine  A u-turn  B stop  D-pad limit  L-stick boost  R-stick recover  Back pairing\n"
+                 "key: W/S gas/brake  A/D steer  Q/E lanes  F fire  G mine  U u-turn  Space stop  +/- limit  LShift boost  R recover AI  Esc pairing  F11 fullscreen")
 
 
 class App:
@@ -104,16 +104,24 @@ class App:
                 return None
 
         async def connect_all():
-            return [c for c in await asyncio.gather(*(connect(d, m) for d, m in found)) if c]
+            vehicles = []
+            for device, model in found:
+                car = await connect(device, model)
+                if car is not None:
+                    vehicles.append(car)
+            return vehicles
 
-        vehicles = self.ble.call(connect_all(), timeout=60)
+        vehicles = self.ble.call(connect_all(), timeout=20 * len(found) + 10)
         if not vehicles:
             self.renderer.draw_message("Could not connect to any car", [])
             time.sleep(3)
             return False
         for i, v in enumerate(vehicles):
-            cs = CarState(v, i, self.ble, self.args.max_speed)
-            v.on_message = cs.on_message
+            cs = CarState(v, i, self.ble, self.args.max_speed if self.args.max_speed is not None else 800)
+            cs.player_max_speed = self.args.player_max_speed
+            cs.ai_difficulty = self.args.ai_difficulty
+            cs.extreme_max_speed = self.args.max_speed if self.args.max_speed is not None else 2000
+            v.on_message = cs.enqueue_message
             self.cars.append(cs)
         track = Track.load(TRACK_FILE)
         if track:
@@ -139,10 +147,10 @@ class App:
                 self.start_scan_all()
                 return True
             elif "race" in btns and btns["race"].collidepoint(pos):
-                if self.claims:
+                if g.can_start(self.claims.values()):
                     self.start_race()
                     return True
-                self.status = "take a car first (A / Enter), then race"
+                self.status = "assign a player or AI to a connected car off its charger"
             elif "mode" in btns and btns["mode"].collidepoint(pos):
                 self.toggle_mode()
             elif "laps" in btns and btns["laps"].collidepoint(pos):
@@ -175,17 +183,19 @@ class App:
             if s.pressed(I.TOGGLE_AI):
                 if car in self.claims.values():
                     self.status = f"{car.name} has a player; release it first"
+                elif not g.ai_enabled:
+                    self.status = "AI disabled by --no-ai; restart without that option to enable it"
                 else:
-                    car.ai_pref = not car.ai_pref
-                    self.status = f"{car.name} will be {'driven by the AI' if car.ai_pref else 'parked'}"
+                    car.cycle_ai()
+                    self.status = f"{car.name}: AI {car.ai_difficulty.title()}" if car.ai_pref else f"{car.name}: parked"
             if s.pressed(I.SCAN):
                 self.start_scan_all()
                 return True
             if s.pressed(I.TOGGLE_MODE):
                 self.toggle_mode()
             if s.pressed(I.READY):
-                if not self.claims:
-                    self.status = "take a car first (A / Enter), then Start / Space"
+                if not g.can_start(self.claims.values()):
+                    self.status = "assign a player or AI to a connected car off its charger"
                 else:
                     self.start_race()
                     return True
@@ -329,6 +339,8 @@ class App:
                 self.state = PAIRING
                 self.status = "back to pairing (cars stopped)"
                 return
+            if s.pressed(I.RECOVER):
+                g.retry_ai_recovery()
         g.tick(dt)
         if g.finished and time.monotonic() - g.finish_t > 7.0:
             winner = g.winner
@@ -376,8 +388,10 @@ class App:
             self.shutdown()
             return 1
         assert self.game is not None
-        dt = 1.0 / TICK_HZ
+        frame_period = 1.0 / TICK_HZ
+        dt = frame_period
         t_start = time.monotonic()
+        previous_tick = t_start - frame_period
         last_batt = t_start
         if self.args.autostart:
             self.start_race()
@@ -387,7 +401,11 @@ class App:
         try:
             while running:
                 t0 = time.monotonic()
+                dt = min(0.25, max(0.0, t0 - previous_tick))
+                previous_tick = t0
                 running = self.handle_events()
+                for car in self.cars:
+                    car.drain_messages()
                 for s in self.sources:
                     s.poll(dt)
                 if self.state == PAIRING:
@@ -414,7 +432,7 @@ class App:
                     if self.args.screenshot:
                         pygame.image.save(self.screen, self.args.screenshot)
                     running = False
-                time.sleep(max(0.0, dt - (time.monotonic() - t0)))
+                time.sleep(max(0.0, frame_period - (time.monotonic() - t0)))
         except KeyboardInterrupt:
             pass
         finally:
@@ -495,15 +513,18 @@ class App:
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--max-speed", type=int, default=800, help="initial speed limit in mm/s (default 800; cars do ~1500+)")
+    ap.add_argument("--max-speed", type=int, default=None, help="AI speed ceiling in mm/s (default 800; Extreme automatically uses up to 2000)")
+    ap.add_argument("--player-max-speed", type=int, choices=range(200, 2001), metavar="200..2000", default=2000,
+                    help="initial controller/keyboard speed limit (default 2000)")
     ap.add_argument("--max-cars", type=int, default=4)
     ap.add_argument("--scan", type=float, default=5.0, help="BLE scan duration in seconds")
     ap.add_argument("--car", action="append", help="only use this car address (repeatable)")
     ap.add_argument("--keyboard-only", action="store_true", help="ignore gamepads")
+    ap.add_argument("--ai-difficulty", choices=("easy", "normal", "hard", "extreme"), default="normal", help="initial AI level for every car")
     ap.add_argument("--no-ai", action="store_true", help="unclaimed cars stay parked instead of being driven by AI")
     ap.add_argument("--mode", choices=["battle", "race"], default="battle", help="battle = weapons and kills; race = laps only (default battle)")
     ap.add_argument("--laps", type=int, default=5, help="race mode: laps to win (default 5)")
-    ap.add_argument("--ai-speed", type=int, default=450, help="AI cruising speed mm/s (default 450)")
+    ap.add_argument("--ai-speed", type=int, default=None, help="override AI normal straight speed mm/s (default: scales with car limit; Hard uses full limit)")
     ap.add_argument("--accel", type=int, default=600, help="acceleration mm/s^2 (default 600; higher may reboot cars with weak batteries)")
     ap.add_argument("--autostart", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--autoscan", action="store_true", help=argparse.SUPPRESS)

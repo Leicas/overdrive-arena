@@ -328,11 +328,12 @@ class CarLocalizer:
         self.on_track = False
 
     # ---- message handling (called from the BLE thread) ----
-    def on_message(self, msg_id: int, decoded) -> None:
+    def on_message(self, msg_id: int, decoded, received_at: Optional[float] = None) -> None:
+        now = time.monotonic() if received_at is None else received_at
         if msg_id == P.MSG_LOCALIZATION_POSITION_UPDATE and isinstance(decoded, P.PositionUpdate):
-            self._on_position(decoded)
+            self._on_position(decoded, now)
         elif msg_id == P.MSG_LOCALIZATION_TRANSITION_UPDATE and isinstance(decoded, P.TransitionUpdate):
-            self._on_transition(decoded)
+            self._on_transition(decoded, now)
         elif msg_id == P.MSG_VEHICLE_DELOCALIZED:
             self.on_track = False
 
@@ -350,22 +351,36 @@ class CarLocalizer:
                 return k
         return None
 
-    def _on_position(self, pos: P.PositionUpdate) -> None:
+    def _on_position(self, pos: P.PositionUpdate, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
         k = self._match(pos.piece)
         if k is None:
             return
         piece = self.track.pieces[k]
         located = locate(pos.piece, pos.location, pos.reverse_parsing)
+        self.speed = float(pos.speed_mm_s)
+        if located is None:
+            # A recognized piece with an unknown location is not a position fix.
+            return
+        frac = 1.0 - located[1] if piece.reversed else located[1]
+        direction = 1 if pos.reverse_parsing == piece.reversed else -1
+        if self.index == k and direction == self.direction:
+            next_k = (k + direction) % len(self.track.pieces)
+            next_piece = self.track.pieces[next_k]
+            wrapped = (self.frac > 0.75 and frac < 0.35) if direction > 0 else (self.frac < 0.25 and frac > 0.65)
+            if (wrapped and next_k != k and next_piece.id == piece.id
+                    and next_piece.reversed == piece.reversed):
+                # A missed transition between identical adjacent pieces otherwise
+                # leaves _match() stuck on the earlier piece indefinitely.
+                k, piece = next_k, next_piece
         self.index = k
         self.last_code_piece = pos.piece
-        self.last_code_t = time.monotonic()
+        self.last_code_t = now
         self.on_track = True
         self.speed = float(pos.speed_mm_s)
-        self.last_update = time.monotonic()
+        self.last_update = now
         # direction relative to the scan: same reverse flag -> same direction
         self.direction = 1 if pos.reverse_parsing == piece.reversed else -1
-        if located is None:
-            return
         lane_car, frac_print = located
         # fraction in the track-forward frame: the scanning car read the codes with piece.reversed
         frac = 1.0 - frac_print if piece.reversed else frac_print
@@ -373,10 +388,13 @@ class CarLocalizer:
             self.sub_id = pos.piece
             half = 0.0 if pos.piece == START_ID else 0.5
             frac = half + 0.5 * frac
+        else:
+            self.sub_id = None
         self.frac = frac
         self.lane_mm = lane_car if self.direction > 0 else -lane_car
 
-    def _on_transition(self, _tr: P.TransitionUpdate) -> None:
+    def _on_transition(self, _tr: P.TransitionUpdate, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
         if self.index is None:
             return
         piece = self.track.pieces[self.index]
@@ -386,17 +404,17 @@ class CarLocalizer:
             # in the current half (common at low speed) decide from the dead-reckoned position instead.
             if self.direction > 0 and (self.sub_id == START_ID or (self.sub_id is None and self.frac < 0.85)):
                 self.frac, self.sub_id = 0.5, FINISH_ID
-                self.last_update = time.monotonic()
+                self.last_update = now
                 return
             if self.direction < 0 and (self.sub_id == FINISH_ID or (self.sub_id is None and self.frac > 0.15)):
                 self.frac, self.sub_id = 0.5, START_ID
-                self.last_update = time.monotonic()
+                self.last_update = now
                 return
         self.sub_id = None
         self.last_code_piece = None
         self.index = (self.index + self.direction) % n
         self.frac = 0.03 if self.direction > 0 else 0.97
-        self.last_update = time.monotonic()
+        self.last_update = now
 
     # ---- main-thread helpers ----
     def advance(self, dt: float) -> None:

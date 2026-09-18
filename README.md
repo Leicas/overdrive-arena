@@ -28,7 +28,7 @@ cars directly, with the protocol verified on real hardware (firmware 11866) and 
 - **Starting grid**: every car drives itself to the start line in its own lane and stops on the finish-line
   bar; 3-2-1-GO releases them together.
 - **Two modes**: BATTLE (blasters, mines, HP, kills) or RACE (laps only, first to N laps wins).
-- **AI drivers** for cars nobody claims; they keep to the track direction.
+- **AI drivers** with per-car Easy, Normal, Hard, and Extreme levels, including AI-only races. They brake before curves and accelerate on straights.
 - **Battery and charger tracking**: voltage, estimated %, sag under load (finds tired cells), CHARGING /
   CHARGED when a car sits on its pad, CSV history.
 - **Robust links**: automatic reconnection when a car reboots, gentle default acceleration for old batteries.
@@ -54,15 +54,16 @@ Cars must be powered on. Turn controllers on before starting (or later, they hot
    **AI** or **PARKED**. Every controller and the keyboard has its own cursor badge floating above the cards.
    - Move the cursor: D-pad / left stick (keyboard: Left/Right). The car under a cursor blinks its headlights.
    - **A** (Enter): take the car you are hovering. Press again, or **B** (Backspace), to release it.
-   - **X** (Tab): switch a car nobody has taken between AI and parked.
+   - **X** (Tab): cycle an unclaimed car through Easy / Normal / Hard / Extreme / Parked (default: Normal).
    - **SCAN TRACK** (Y / T / click): every connected car drives a lap; the first to close the loop provides the
      map. Cars that read no track code within 8 s are flagged "NOT ON THE TRACK". Do this once per layout.
    - **BATTLE / RACE** (M / stick click / click) picks the mode; the **laps** button cycles 3 / 5 / 10 / 20.
-   - **RACE** (Start / Space / click): enabled once at least one car has a player. The controllers legend and
+   - **RACE** (Start / Space / click): enabled with at least one connected player or AI car off its charger. Leave all cars unclaimed for an AI-only race. The controllers legend and
      the "players / AI / parked" line tell you who drives what.
 3. **Starting grid**: each participant drives to the start line in its own lane (turning around first if it
    faces the wrong way), crawls the last half piece at 200 mm/s and stops on the finish-line bar. Cars that
-   arrive in the wrong lane do one more lap; cars that read no codes within 12 s, or sit on their charger,
+   overshoot the line or arrive in the wrong lane do a full lap before trying again; after three failed
+   attempts they stop and are left out. Cars that read no codes within 12 s, or sit on their charger,
    are left out. Then **3-2-1-GO**.
 4. **Race**. **Back** (Esc) stops everything and returns to pairing. **F11** toggles fullscreen.
 
@@ -74,9 +75,24 @@ Cars must be powered on. Turn controllers on before starting (or later, they hot
 | Fire blaster        | X               | Square        | F                 |
 | Drop mine           | Y               | Triangle      | G                 |
 | U-turn              | A               | Cross         | U                 |
+| Straight boost      | Left stick click | L3           | Left Shift        |
+| Retry AI recovery   | Right stick click | R3          | R                 |
 | Emergency stop      | B               | Circle        | Space             |
 | Speed limit +/- 100 | D-pad up/down   | D-pad up/down | + / -             |
 | Back / quit         | View            | Share         | Esc               |
+
+### Speed and boost
+
+Player throttle uses a separate **2000 mm/s command limit** by default. Full RT/R2 (or full keyboard
+throttle) requests that speed; D-pad up/down or +/- changes the player's limit by 100 mm/s. The limit
+is retained when you release/reclaim a car and does not raise its AI limit. Actual motor speed may be
+lower. `--player-max-speed` sets a lower initial limit; `--max-speed` sets the AI limit.
+
+**Left-stick click / Left Shift** requests a 0.6-second straight boost, with a 6-second cooldown.
+Hard and Extreme AI use it automatically when possible. The boost ceiling is 150% of the normal limit,
+capped at 1500 mm/s, and braking-distance checks may lower the target. Boost does not raise curve or
+learned corner limits and cancels for curves, stale position data, recovery, lane changes, or nearby
+traffic. A player already using the full 2000 command range needs no boost.
 
 ### Battle weapons
 
@@ -93,6 +109,41 @@ Weapons off. Cards show `LAP n / target` and a progress bar; ranking by laps the
 the target gets a "X WINS" banner, the others roll to a stop, and the app returns to pairing.
 `--mode race --laps 10` pre-selects.
 
+By default, AI straight / curve targets are 64% / 52% (Easy), 80% / 68% (Normal), and
+100% / 84% (Hard) of the car speed limit. Hard uses the full limit on straights with enough braking room.
+An explicit `--ai-speed` overrides the Normal straight baseline; Easy uses 80% and Hard 125% of it,
+always capped by the car speed limit. Actual speed depends on acceleration and available straight length. Hard AI also reacts faster with weapons in Battle.
+Unknown positions use a cautious speed up to 300 mm/s. Hard brakes later for turns. In Race mode, AI checks cars ahead and behind before passing into an adjacent lane, reserves pending lane changes, and slows behind traffic when blocked. Lane changes start only on straights. The AI looks three pieces ahead and prefers the shortest clear lane through upcoming curves, moving one adjacent lane at a time. Balanced left/right turns keep the current lane to avoid needless weaving.
+
+**Extreme** automatically uses a ceiling of **2,000 mm/s**; an explicit `--max-speed` overrides it.
+It chooses the actual target from the current lane, requested lane, and braking distance to upcoming
+curves, with an 80 ms braking margin. Corner speed starts from the tighter lane radius
+(`v = sqrt(3200 * radius_mm)`). Short straights may never allow the full ceiling before braking.
+This is a tunable driving model, not a measured grip guarantee for every car and track.
+
+AI learns a corner-speed limit separately for each car. A spin or confirmed off-track event near a
+curve lowers that limit by 15% (minimum 200 mm/s); retries during the same recovery do not lower it
+again. Extreme scales this learned limit with curve radius: tighter lanes need lower speeds, while
+wider curves can be faster. The lower corner limit also brings braking forward on the approach.
+After three fully observed clean turns at at least 90% of the learned limit, AI probes 2% faster,
+bounded by the difficulty's normal limit and, for Extreme, the geometry estimate. Slow traffic does
+not earn a speed increase. The HUD shows the learned reference turn limit and the event feed reports
+adjustments. Learning stays in memory across races; restarting the app or loading/scanning a track
+resets it.
+
+A reversal invalidates the current lap. The next forward finish-line crossing starts a fresh timed
+lap; it earns no point. A complete forward circuit is required to score again, so U-turns, finish-line
+oscillation, and lost localization cannot create a shortcut lap. Already completed laps are retained.
+
+### Off-track AI recovery
+
+An explicit off-track report stops that AI immediately. If track messages go stale instead,
+it tries reading the track at 250 mm/s for at most 1.5 seconds, then stops. There are no endless retries.
+Put a stopped car back on the track and press **R** (or click the right stick) to give waiting AI cars
+one short detection attempt. Fresh track codes resume driving automatically; wrong-way recovery still
+applies. Cars on chargers or with lost connections do not search. Recovery invalidates the current lap.
+Leaving a curve and reporting off-track also lowers the learned corner limit once per incident, including a report that arrives after a search has begun or between rendered frames. Missing telemetry alone does not count as a cornering failure.
+
 ### What the screen shows
 
 - **Map**: car sprites with trails, hit rings, explosions, floating damage; mines pulse once armed; cars that
@@ -101,6 +152,26 @@ the target gets a "X WINS" banner, the others roll to a stop, and the app return
   WRONG WAY / OFF TRACK / ON CHARGER), HP or lap progress, speed bar and limit, lane indicator, weapon dials,
   laps with last and best time, battery row.
 - **Kill feed** in player colours, race clock.
+
+### Position and Bluetooth diagnostics
+
+The speed row shows **P** (age of the latest usable position/transition update) and **BT** (age of
+any received car notification). During motion, a fresh BT age with an old P age points toward missing
+track readings/localization; both old means no notifications have arrived recently, but does not by
+itself prove radio interference. Stationary cars naturally report fewer track codes.
+`-v` also logs notification-to-game processing delay as `queue_delay`.
+
+Bluetooth callbacks enqueue messages; the game thread applies localization, battery logging, and
+scanner updates in order using the original reception timestamps. This keeps disk I/O out of the BLE
+loop and prevents rendering/driving from seeing half-applied positions. Startup connects cars serially.
+Unknown track locations no longer masquerade as fresh position fixes; a forward/backward code wrap
+between identical adjacent pieces can repair a missed transition.
+
+The map interpolates between discrete printed track codes; it is not a continuous physical-position
+sensor. These changes improve software handling, but do not establish that every gap is software-caused.
+For comparison tests, use charged cars and wired controllers, and compare one car with three on the same
+track. Earlier hardware trials showed weaker links with Bluetooth controllers sharing the adapter and
+battery voltage sag under acceleration.
 
 ### Battery and charger
 
@@ -113,9 +184,11 @@ that car is the one most likely to reboot under hard acceleration. `LOW` below 3
 ## Options
 
 ```
---max-speed N     initial speed limit mm/s (default 800; the cars do ~1500)
+--max-speed N     AI speed ceiling mm/s (default 800; Extreme 2000)
+--player-max-speed N  controller/keyboard limit 200..2000 mm/s (default 2000)
 --accel N         acceleration mm/s^2 (default 600; harder launches reboot cars with weak batteries)
---ai-speed N      AI cruising speed (default 450)      --no-ai   unclaimed cars stay parked
+--ai-speed N      optional Normal straight baseline (default scales with car limit)      --no-ai   unclaimed cars stay parked
+--ai-difficulty easy|normal|hard|extreme (default normal)
 --mode battle|race   --laps N                          --keyboard-only
 --max-cars N   --car ADDRESS (repeatable)   --scan SECONDS
 ```
@@ -142,8 +215,21 @@ game/game.py        driving, AI, grid, weapons, laps, damage
 game/battery.py     battery monitor
 game/render.py      map, HUD, screens
 tools/              small CLI scripts used while reverse-engineering (scan, drive, lane, lights, lap logs)
-tests/              recorded lap + offline replay and render scripts
+tests/              AI, grid, learning, telemetry tests + recorded lap replay and render scripts
 ```
+
+## Development checks
+
+Run the offline regression suite without connecting cars:
+
+```powershell
+.venv\Scripts\python -m unittest discover -s tests -p "test_*.py"
+.venv\Scripts\python tests/render_demo.py
+```
+
+Tests cover AI speed planning, traffic, boost, grid retries, lap validation, learning, recovery,
+and telemetry handling. Render demos generate local preview images. Hardware speed and grip still
+need verification on the actual cars and layout.
 
 ## Protocol notes (firmware 11866, verified on X52 / Mammoth / Dynamo)
 
