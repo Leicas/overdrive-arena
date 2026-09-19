@@ -17,6 +17,7 @@ from anki.track import CarLocalizer, Track, STRAIGHT, START, CRISSCROSS, TURN
 from anki.vehicle import Vehicle
 from . import inputs as I
 from .battery import BatteryMonitor
+from .records import Records
 
 log = logging.getLogger("game")
 
@@ -118,6 +119,7 @@ class CarState:
         self.extra_listener = None          # e.g. the track scanner while scanning
         self._messages = SimpleQueue()
         self.last_radio_t = 0.0
+        self._last_motion_t = float("-inf")
         self.message_delay_s = 0.0
         self.battery = BatteryMonitor(car.model, BATTERY_LOG)
         if car.battery_mv:
@@ -133,7 +135,11 @@ class CarState:
         self.lap_start_t: Optional[float] = None
         self.last_lap_s: Optional[float] = None
         self.best_lap_s: Optional[float] = None
+        self.race_finish_s: Optional[float] = None
         self._prev_progress: Optional[float] = None
+        self._prev_progress_t: Optional[float] = None
+        self._route_epoch = None
+        self.lap_note = "cross start to time a lap"
         self._lap_travel = 0.0             # net forward progress since a clean line crossing
         self._reverse_reports = 0         # BLE-thread counter: do not lose brief reversals between frames
         self._lap_reverse_seen = 0
@@ -228,8 +234,8 @@ class CarState:
             self.ai_difficulty = levels[levels.index(self.ai_difficulty) + 1]
 
     # ---- messages (enqueue on BLE thread, apply on game thread) ----
-    def enqueue_message(self, msg_id: int, decoded) -> None:
-        received = time.monotonic()
+    def enqueue_message(self, msg_id: int, decoded, received_at: Optional[float] = None) -> None:
+        received = time.monotonic() if received_at is None else received_at
         self.last_radio_t = received
         self._messages.put((msg_id, decoded, received))
 
@@ -245,6 +251,11 @@ class CarState:
     def on_message(self, msg_id: int, decoded, received_at: Optional[float] = None) -> None:
         received_at = time.monotonic() if received_at is None else received_at
         self.last_radio_t = max(self.last_radio_t, received_at)
+        if msg_id in (P.MSG_LOCALIZATION_POSITION_UPDATE, P.MSG_LOCALIZATION_TRANSITION_UPDATE,
+                      P.MSG_SPEED_UPDATE, P.MSG_VEHICLE_DELOCALIZED):
+            if received_at < self._last_motion_t:
+                return
+            self._last_motion_t = received_at
         if msg_id == P.MSG_VEHICLE_DELOCALIZED:
             self._offtrack_reports += 1
             self._last_offtrack_t = received_at
@@ -256,6 +267,7 @@ class CarState:
                 self.loc.on_track = False
         elif msg_id == P.MSG_SPEED_UPDATE and isinstance(decoded, P.SpeedUpdate) and self.loc is not None:
             self.loc.speed = float(decoded.actual_mm_s)
+            self.loc.filter.set_speed(self.loc.direction * self.loc.speed, received_at)
         if self.loc is not None:
             self.loc.on_message(msg_id, decoded, received_at=received_at)
             if msg_id == P.MSG_LOCALIZATION_POSITION_UPDATE and self.loc.direction < 0:
@@ -294,6 +306,12 @@ class CarState:
         return (self.car.connected and self.loc is not None and self.loc.on_track and self.loc.index is not None
                 and time.monotonic() - self.loc.last_update < 6.0)
 
+    def map_position_known(self) -> bool:
+        """Keep a stopped car's last pose visible without claiming fresh telemetry."""
+        if self.loc is None or self.loc.index is None or not self.loc.on_track or self.charging:
+            return False
+        return self.localized() or (self.speed_sent() == 0 and self.loc.speed == 0)
+
     # ---- status ----
     def is_dead(self, now: float) -> bool:
         return now < self.dead_until
@@ -321,12 +339,14 @@ class CarState:
             self.ble.fire(self.car.set_speed(speed, accel))
         if speed == 0 and self.loc is not None:
             self.loc.speed = 0.0
+            self.loc.filter.set_speed(0, now)
 
     def hard_stop(self, now: float) -> None:
         self._last_speed_sent, self._last_speed_t = 0, now
         self.ble.fire(self.car.set_speed(0, ACCEL_STOP))
         if self.loc is not None:
             self.loc.speed = 0.0
+            self.loc.filter.set_speed(0, now)
 
     def participates(self) -> bool:
         return self.source is not None or self.ai
@@ -426,11 +446,13 @@ class Game:
         self.race_start_t: Optional[float] = None
         self.phase = "idle"                 # idle | grid | countdown | race
         self.countdown_t0 = 0.0
+        self._countdown_pulse = None
         self.mode = "battle"                # battle (weapons, kills) | race (laps only, no weapons)
         self.lap_target = 5
         self.winner: Optional[CarState] = None
         self.finish_t = 0.0
         self.running = False
+        self.records = Records()
         for c in cars:
             c.set_track(track)
 
@@ -486,7 +508,7 @@ class Game:
         now = time.monotonic()
         for c in self.cars:
             if c.loc:
-                c.loc.advance(dt)
+                c.loc.advance(dt, now)
         done = True
         for c in self.cars:
             st = c.grid_state
@@ -575,12 +597,24 @@ class Game:
     def begin_countdown(self) -> None:
         self.phase = "countdown"
         self.countdown_t0 = time.monotonic()
+        self._countdown_pulse = None
+        self.countdown_feedback()
         for c in self.cars:
             if c.grid_state == "placed":
                 c.lights_flash(self.countdown_t0, COUNTDOWN_S)
 
     def countdown_left(self) -> float:
         return max(0.0, COUNTDOWN_S - (time.monotonic() - self.countdown_t0))
+
+    def countdown_feedback(self) -> None:
+        beat = math.ceil(self.countdown_left())
+        if beat == self._countdown_pulse:
+            return
+        self._countdown_pulse = beat
+        for c in self.cars:
+            if c.grid_state == "placed" and c.source is not None and c.source.alive():
+                c.source.rumble(0.8 if beat == 0 else 0.35, 0.9 if beat == 0 else 0.35,
+                                400 if beat == 0 else 140)
 
     @property
     def weapons_enabled(self) -> bool:
@@ -607,8 +641,14 @@ class Game:
             c.hp = MAX_HP
             c.kills = c.deaths = c.laps = 0
             c.last_lap_s = c.best_lap_s = None
+            c.race_finish_s = None
             c.lap_start_t = None
             c._prev_progress = None
+            c._prev_progress_t = None
+            c._route_epoch = c.loc.route_epoch if c.loc else None
+            c.lap_note = "cross start to time a lap"
+            if c.loc:
+                c.loc.motion_samples.clear()
             c._lap_travel = 0.0
             c._lap_reverse_seen = c.ai_reverse_seen = c._reverse_reports
             c._lap_offtrack_seen = c._ai_offtrack_seen = c._offtrack_reports
@@ -620,11 +660,15 @@ class Game:
             c.ai_track_recovery = ""
             c.boost_until = 0.0
             c.boost_ready_at = now + 3.0
-            if (c.grid_state == "placed" and c.localized() and c.loc is not None
+            if (c.grid_state == "placed" and c.map_position_known() and c.loc is not None
                     and c.loc.direction > 0 and c.loc.index == 0 and 0.5 <= c.loc.frac < 0.6):
                 # A car correctly parked on the bar starts its first timed lap at GO.
                 c.lap_start_t = now
+                c.lap_note = "timing"
                 c._prev_progress = c.loc.progress()
+                if c.loc._display_distance is not None:
+                    c._prev_progress = self._route_progress(c, c.loc._display_distance)
+                c._prev_progress_t = now
             c.dead_until = c.stun_until = c.penalty_until = 0.0
             if c.grid_state in ("off track", "charging", "missed start"):
                 c.ai = False
@@ -655,61 +699,137 @@ class Game:
 
     def ranking(self) -> list["CarState"]:
         def progress(c: CarState) -> float:
-            p = c.loc.progress() if c.localized() and c.loc else None
-            return p if p is not None else -1.0
+            p = c.loc.progress() if c.map_position_known() and c.loc else None
+            return (p - 0.5) % len(self.track.pieces) if p is not None and self.track else -1.0
         if self.mode == "race":
-            return sorted(self.cars, key=lambda c: (-c.laps, -progress(c), c.index))
+            return sorted(self.cars, key=lambda c: (-c.laps, c.race_finish_s if c.race_finish_s is not None else float("inf"),
+                                                    -progress(c), c.index))
         return sorted(self.cars, key=lambda c: (-c.kills, c.deaths, -c.laps, c.index))
 
     def _track_laps(self, c: CarState, now: float) -> None:
         """Only credit a complete forward circuit between clean finish-line crossings."""
+        if self.mode == "race" and c.race_finish_s is not None:
+            if c.loc:
+                c.loc.motion_samples.clear()
+            return
         reversed_since_tick = c._reverse_reports != c._lap_reverse_seen
         c._lap_reverse_seen = c._reverse_reports
         offtrack_since_tick = c._offtrack_reports != c._lap_offtrack_seen
         c._lap_offtrack_seen = c._offtrack_reports
-        if not c.localized() or c.ai_track_recovery or self.wrong_way(c) or reversed_since_tick or offtrack_since_tick:
+        pose_lost = c.loc is None or c.loc.index is None or not c.loc.on_track or c.charging
+        if pose_lost or c.ai_track_recovery or self.wrong_way(c) or reversed_since_tick or offtrack_since_tick:
+            reason = ("lap reset: reverse" if self.wrong_way(c) or reversed_since_tick else
+                      "lap reset: off track" if offtrack_since_tick or (c.loc and not c.loc.on_track) else
+                      "lap reset: recovery" if c.ai_track_recovery else "lap reset: position unavailable")
+            self._lap_note(c, reason)
             c._prev_progress = None
             c._lap_travel = 0.0
             c.lap_start_t = None
+            c._prev_progress_t = None
+            if c.loc:
+                c.loc.motion_samples.clear()
             return
-        p = c.loc.progress()  # type: ignore[union-attr]
+        if not c.localized() and c.speed_sent() > 0:
+            self._lap_note(c, "position stale; holding estimate")
+        elif c.lap_start_t is not None:
+            c.lap_note = "timing"
+        if c.loc.filter.position is not None:
+            # The very same unwrapped estimate drives the map and finish events.
+            c.loc.advance(0, now)
+            while c.loc.motion_samples:
+                distance, received, epoch = c.loc.motion_samples.popleft()
+                if received < (self.race_start_t or 0):
+                    continue
+                if distance is None or (c._route_epoch is not None and epoch != c._route_epoch):
+                    c._prev_progress = c._prev_progress_t = c.lap_start_t = None
+                    c._lap_travel = 0.0
+                    self._lap_note(c, "lap reset: position reacquired")
+                c._route_epoch = epoch
+                if distance is not None:
+                    progress = self._route_progress(c, distance)
+                    self._track_lap_sample(c, progress, received, unwrapped=True)
+            return
+        self._track_lap_sample(c, c.loc.progress(), now)
+
+    @staticmethod
+    def _route_progress(c: CarState, distance: float) -> float:
+        route = c.loc.filter
+        index, frac = route.pose(distance)
+        return math.floor(distance / route.length) * len(c.loc.track.pieces) + index + frac
+
+    def _lap_note(self, c: CarState, reason: str) -> None:
+        if c.lap_note != reason:
+            c.lap_note = reason
+            self.log(f"{c.name}: {reason}", c.color)
+
+    def _track_lap_sample(self, c: CarState, p: Optional[float], now: float, allowed: float = 1.25, *, unwrapped: bool = False) -> None:
+        if self.mode == "race" and c.race_finish_s is not None:
+            return
         prev = c._prev_progress
+        previous_t = c._prev_progress_t
         c._prev_progress = p
+        c._prev_progress_t = now
         if p is None or prev is None:
+            # Establish a baseline; an arbitrary initial pose is not a lap.
+            if prev is None and c.lap_start_t is None:
+                c._lap_travel = 0.0
             return
         n = len(self.track.pieces) if self.track else 1
-        delta = (p - prev + n / 2) % n - n / 2
-        if abs(delta) > 1.25:
+        delta = p - prev if unwrapped else (p - prev + n / 2) % n - n / 2
+        if not unwrapped and abs(delta) > allowed:
             # Relocalization/teleport is not proof that the skipped track was driven.
             c.lap_start_t = None
             c._lap_travel = 0.0
             return
         c._lap_travel += delta
-        if prev < 0.5 <= p and p - prev < 0.6:
-            if c.lap_start_t is not None and c._lap_travel >= n - 0.25:
-                lap = now - c.lap_start_t
-                if lap > 2.0:
+        to_line = (0.5 - prev) % n
+        if delta > 0 and 0 < to_line <= delta + 1e-9:
+            fraction = to_line / delta
+            if self.track:
+                lengths = [piece.length_at(c.loc.lane_mm) for piece in self.track.pieces]
+                def distance(progress):
+                    progress %= n
+                    index = int(progress)
+                    return sum(lengths[:index]) + (progress - index) * lengths[index]
+                total = sum(lengths)
+                travelled = (distance(p) - distance(prev)) % total
+                if travelled > 0:
+                    fraction = ((distance(.5) - distance(prev)) % total) / travelled
+            crossing_t = now if previous_t is None else previous_t + (now - previous_t) * fraction
+            overshoot = delta - to_line
+            if c.lap_start_t is not None and c._lap_travel - overshoot >= n - 0.15:
+                lap = crossing_t - c.lap_start_t
+                if lap > 0:
                     c.laps += 1
                     c.last_lap_s = lap
+                    self.records.record(self.track, self.mode, c, "lap", lap)
                     if c.best_lap_s is None or lap < c.best_lap_s:
                         c.best_lap_s = lap
                         self.log(f"{c.name} lap {c.laps}: {lap:.2f}s (best)", c.color)
                     else:
                         self.log(f"{c.name} lap {c.laps}: {lap:.2f}s", c.color)
-                    if self.mode == "race" and self.winner is None and c.laps >= self.lap_target:
+                    if self.mode == "race" and c.laps >= self.lap_target and c.race_finish_s is None and self.race_start_t is not None:
+                        c.race_finish_s = crossing_t - self.race_start_t
+                        self.records.record(self.track, self.mode, c, "race", c.race_finish_s, self.lap_target)
+                    if self.mode == "race" and c.laps >= self.lap_target and (self.winner is None or crossing_t < self.finish_t):
                         self.winner = c
-                        self.finish_t = now
+                        self.finish_t = crossing_t
                         self.effect("boom", c.world(), c.color, 1.5)
                         self.log(f"{c.name} WINS the race!", c.color)
-            c.lap_start_t = now
-            c._lap_travel = 0.0
+                c.lap_start_t = crossing_t
+                c.lap_note = "timing"
+                c._lap_travel = overshoot
+            elif c.lap_start_t is None:
+                c.lap_start_t = crossing_t
+                c.lap_note = "timing"
+                c._lap_travel = overshoot
 
     # ---- per frame ----
     def tick(self, dt: float) -> None:
         now = time.monotonic()
         for c in self.cars:
             if c.loc:
-                c.loc.advance(dt)
+                c.loc.advance(dt, now)
         self.fx = [e for e in self.fx if now - e.t0 < e.duration]
         if not self.running:
             return
@@ -747,6 +867,13 @@ class Game:
     def _human(self, c: CarState, dt: float, now: float) -> None:
         src = c.source
         assert src is not None
+        if c.ai_track_recovery:
+            if src.pressed(I.STOP) or src.brake() > 0.1:
+                c.ai_track_recovery = "waiting"
+                c.hard_stop(now)
+                return
+            if self._recover_ai_track(c, now):
+                return
         if src.pressed(I.LIMIT_UP):
             c.max_speed = min(2000, c.max_speed + 100)
         if src.pressed(I.LIMIT_DOWN):
@@ -1006,6 +1133,27 @@ class Game:
         else:
             c.ai_curve_test_speed = min(c.ai_curve_test_speed, loc.speed, c.speed_sent())
         c.ai_curve_last_frac = loc.frac
+
+    def retry_recovery(self, source=None) -> None:
+        """Retry waiting AI and the requesting player's car after replacement."""
+        self.retry_ai_recovery()
+        if not self.running or self.finished or not self.track:
+            return
+        now = time.monotonic()
+        for c in self.cars:
+            if c.source is None or (source is not None and c.source is not source):
+                continue
+            if not c.car.connected or c.charging:
+                continue
+            if self.wrong_way(c):
+                c.u_turn()
+            if not c.localized() or now - c.loc.last_update >= 1.5 or c.ai_track_recovery:
+                c.ai_track_recovery = "searching"
+                c.ai_track_recovery_t = now
+                c.ai_manual_track_retry = True
+                c._prev_progress = c.lap_start_t = None
+                c._lap_travel = 0.0
+                self.log(f"{c.name}: retrying track detection", c.color)
 
     def retry_ai_recovery(self) -> None:
         """User has replaced a stopped car; allow one bounded attempt to read codes."""

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,7 @@ from anki.vehicle import Vehicle, discover
 from game import inputs as I
 from game.game import CarState, Game
 from game.render import Renderer
+from game.records import Records
 
 log = logging.getLogger("app")
 
@@ -45,16 +47,18 @@ SCAN_NO_DATA_S = 8.0
 
 PAIRING, SCANNING, GRID, COUNTDOWN, RACE = "pairing", "scanning", "grid", "countdown", "race"
 
-CONTROLS_PAIRING = ("pad:  D-pad/stick move   A take car   B release   X AI level/park   Y scan track   stick-click mode   Start RACE   Back quit\n"
+CONTROLS_PAIRING = ("pad:  Left/Right car   A claim   B release   X AI   Y scan   L-stick mode   Up/Down laps   Start/Options RACE   Back quit\n"
                     "keys: Left/Right move   Enter take car   Backspace release   Tab AI level/park   T scan track   M mode   Space RACE   Esc quit")
 CONTROLS_RACE = ("pad: RT gas  LT brake  stick/LB/RB lanes  X fire  Y mine  A u-turn  B stop  D-pad limit  L-stick boost  R-stick recover  Back pairing\n"
-                 "key: W/S gas/brake  A/D steer  Q/E lanes  F fire  G mine  U u-turn  Space stop  +/- limit  LShift boost  R recover AI  Esc pairing  F11 fullscreen")
+                 "key: W/S gas/brake  A/D steer  Q/E lanes  F fire  G mine  U u-turn  Space stop  +/- limit  LShift boost  R recover  Esc pairing  F11 fullscreen")
 
 
 class App:
     def __init__(self, args):
         self.args = args
         self.ble = BleWorker()
+        # Set before SDL initializes its joystick/controller subsystems.
+        os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
         pygame.init()
         sdlc.init()
         self.screen = pygame.display.set_mode((1280, 760), pygame.RESIZABLE)
@@ -121,12 +125,13 @@ class App:
             cs.player_max_speed = self.args.player_max_speed
             cs.ai_difficulty = self.args.ai_difficulty
             cs.extreme_max_speed = self.args.max_speed if self.args.max_speed is not None else 2000
-            v.on_message = cs.enqueue_message
+            v.on_timed_message = cs.enqueue_message
             self.cars.append(cs)
         track = Track.load(TRACK_FILE)
         if track:
             log.info("loaded %s: %s", TRACK_FILE.name, track.describe())
         self.game = Game(self.ble, self.cars, track, ai_enabled=not self.args.no_ai, ai_speed=self.args.ai_speed)
+        self.game.records = Records(Path(__file__).parent / "records.json")
         self.game.mode = self.args.mode
         self.game.lap_target = self.args.laps
         for cs in self.cars:
@@ -193,6 +198,10 @@ class App:
                 return True
             if s.pressed(I.TOGGLE_MODE):
                 self.toggle_mode()
+            if s.pressed(I.LIMIT_UP) or s.pressed(I.LIMIT_DOWN):
+                step = 1 if s.pressed(I.LIMIT_UP) else -1
+                index = self.lap_choices.index(g.lap_target) if g.lap_target in self.lap_choices else 0
+                g.lap_target = self.lap_choices[(index + step) % len(self.lap_choices)]
             if s.pressed(I.READY):
                 if not g.can_start(self.claims.values()):
                     self.status = "assign a player or AI to a connected car off its charger"
@@ -258,6 +267,7 @@ class App:
             self.status = "start cancelled (cars stopped)"
             return
         g.tick(dt)
+        g.countdown_feedback()
         if g.countdown_left() <= 0:
             g.start()
             self.state = RACE
@@ -333,6 +343,11 @@ class App:
     def race_tick(self, dt: float) -> None:
         g = self.game
         assert g is not None
+        if self.click is not None:
+            pos, self.click = self.click, None
+            button = self.renderer.buttons.get("recover")
+            if button and button.collidepoint(pos):
+                g.retry_recovery()
         for s in self.sources:
             if s.pressed(I.BACK):
                 g.stop_all()
@@ -340,7 +355,11 @@ class App:
                 self.status = "back to pairing (cars stopped)"
                 return
             if s.pressed(I.RECOVER):
-                g.retry_ai_recovery()
+                g.retry_recovery(s)
+            if g.finished and s.pressed(I.READY):
+                g.stop_all()
+                self.start_race()
+                return
         g.tick(dt)
         if g.finished and time.monotonic() - g.finish_t > 7.0:
             winner = g.winner
@@ -489,7 +508,7 @@ class App:
             left = g.countdown_left()
             self.renderer.draw_race(g, CONTROLS_RACE, overlay=f"{int(left) + 1}" if left > 0 else "GO!", sub="get ready")
         elif g.finished and g.winner is not None:
-            self.renderer.draw_race(g, CONTROLS_RACE, overlay=f"{g.winner.name} WINS", sub=f"{g.lap_target} laps  -  back to pairing in a moment")
+            self.renderer.draw_race(g, CONTROLS_RACE, overlay=f"{g.winner.name} WINS", sub=f"{g.lap_target} laps  -  Start / Options: race again  -  Back: menu")
         else:
             self.renderer.draw_race(g, CONTROLS_RACE)
         pygame.display.flip()

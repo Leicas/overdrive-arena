@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Callable, Optional
 
 from bleak import BleakClient, BleakScanner
@@ -72,6 +73,7 @@ class Vehicle:
         self.model = model
         self.client: Optional[BleakClient] = None
         self.on_message: Optional[Callable[[int, object], None]] = None
+        self.on_timed_message: Optional[Callable[[int, object, float], None]] = None
         self.speed = 0
         self.lane_offset = 0.0
         self.battery_mv: Optional[int] = None
@@ -141,6 +143,7 @@ class Vehicle:
         log.warning("disconnected %s", self.address)
 
     def _notify(self, _char, data: bytearray) -> None:
+        received_at = time.monotonic()
         msg_id, decoded = P.parse(bytes(data))
         if msg_id == P.MSG_LOCALIZATION_POSITION_UPDATE:
             self.last_position = decoded  # type: ignore[assignment]
@@ -154,6 +157,8 @@ class Vehicle:
             self.actual_speed = decoded.actual_mm_s
         if self.on_message:
             self.on_message(msg_id, decoded)
+        if self.on_timed_message:
+            self.on_timed_message(msg_id, decoded, received_at)
 
     async def send(self, payload: bytes) -> None:
         if not self.connected:

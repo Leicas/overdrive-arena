@@ -57,7 +57,7 @@ class Pad(InputSource):
         BOOST: (pygame.CONTROLLER_BUTTON_LEFTSTICK,),
         BACK: (pygame.CONTROLLER_BUTTON_BACK,),
         SCAN: (pygame.CONTROLLER_BUTTON_Y,),
-        TOGGLE_MODE: (pygame.CONTROLLER_BUTTON_RIGHTSTICK, pygame.CONTROLLER_BUTTON_LEFTSTICK),
+        TOGGLE_MODE: (pygame.CONTROLLER_BUTTON_LEFTSTICK,),
     }
 
     def __init__(self, index: int, number: int):
@@ -65,6 +65,9 @@ class Pad(InputSource):
         self.name = sdlc.name_forindex(index) or f"pad {index}"  # only safe once is_controller(index) is True
         self.short = f"P{number}"
         self.instance_id = self.ctrl.as_joystick().get_instance_id()
+        # SDL GUID identifies a model, not an individual identical pad. Keep
+        # records under the visible player slot as well, never transient IDs.
+        self.record_id = f"pad:{self.ctrl.as_joystick().get_guid()}:{number}"
         self._now: dict[int, bool] = {}
         self._prev: dict[int, bool] = {}
         self._menu_axis_prev = 0
@@ -121,6 +124,7 @@ class Pad(InputSource):
 
 
 class Keyboard(InputSource):
+    record_id = "keyboard"
     name = "keyboard"
     short = "KB"
     KEYS = {

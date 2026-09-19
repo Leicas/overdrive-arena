@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 # per-installation state
 track.json
+records.json
+records.tmp
 battery_log.csv
 # captures and scratch
 shots/

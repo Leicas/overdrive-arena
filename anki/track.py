@@ -14,12 +14,13 @@ import json
 import math
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from . import protocol as P
+from .position_filter import PositionFilter
 
 DATA_FILE = Path(__file__).parent / "data" / "offsetInfo.json"
 
@@ -326,16 +327,52 @@ class CarLocalizer:
         self.last_code_t = 0.0
         self.last_update = time.monotonic()
         self.on_track = False
+        self.filter = PositionFilter(track)
+        self._sensor_pose = None
+        self._code_pose = None
+        self._prediction_t = self.last_update
+        self._display_distance = None
+        self._display_time = None
+        self.route_epoch = 0
+        self.motion_samples = deque(maxlen=4096)
 
-    # ---- message handling (called from the BLE thread) ----
+    # ---- message handling (drained in arrival order on the game thread) ----
     def on_message(self, msg_id: int, decoded, received_at: Optional[float] = None) -> None:
         now = time.monotonic() if received_at is None else received_at
+        if msg_id not in (P.MSG_LOCALIZATION_POSITION_UPDATE, P.MSG_LOCALIZATION_TRANSITION_UPDATE,
+                          P.MSG_VEHICLE_DELOCALIZED):
+            return
+        if self.filter.position is not None and now < self.filter.last_fix:
+            return  # an old notification must not rewind the estimator
+        if self._sensor_pose is not None:
+            self.index, self.frac, self.sub_id = self._sensor_pose
+        was_on_track, old_direction = self.on_track, self.direction
+        self._fixed = False
         if msg_id == P.MSG_LOCALIZATION_POSITION_UPDATE and isinstance(decoded, P.PositionUpdate):
             self._on_position(decoded, now)
         elif msg_id == P.MSG_LOCALIZATION_TRANSITION_UPDATE and isinstance(decoded, P.TransitionUpdate):
             self._on_transition(decoded, now)
         elif msg_id == P.MSG_VEHICLE_DELOCALIZED:
             self.on_track = False
+            self._sensor_pose = self._code_pose = None
+            self.filter.position = None
+            self._display_distance = None
+            self._display_time = None
+            self.route_epoch += 1
+            self.motion_samples.append((None, now, self.route_epoch))
+            return
+        if self.index is not None and self._fixed:
+            self._sensor_pose = self.index, self.frac, self.sub_id
+            self.filter.observe(self.index, self.frac, self.direction * self.speed,
+                                        self.lane_mm, now,
+                                        reset=not was_on_track or old_direction != self.direction,
+                                        noise=15.0 if msg_id == P.MSG_LOCALIZATION_TRANSITION_UPDATE else 45.0)
+            if not was_on_track or old_direction != self.direction:
+                self._display_distance = None
+                self._display_time = None
+                self.route_epoch += 1
+            self._prediction_t = now
+            self._publish_progress(now)
 
     def _match(self, pid: int) -> Optional[int]:
         pieces = self.track.pieces
@@ -353,23 +390,52 @@ class CarLocalizer:
 
     def _on_position(self, pos: P.PositionUpdate, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
+        if self._code_pose is not None:
+            self.index, self.frac, self.sub_id = self._code_pose
         k = self._match(pos.piece)
         if k is None:
             return
+        # The figure-eight can reuse an ID with the opposite print orientation.
+        # If intermediate codes were missed, matching the old copy first falsely
+        # reports a U-turn. Prefer a reachable forward copy consistent with the
+        # parsing flag; retain real reversals when no such copy is reachable.
+        if self._code_pose is not None and self.on_track:
+            pieces = self.track.pieces
+            gap = max(0, now - self.last_code_t)
+            budget = max(1.25, max(self.speed, pos.speed_mm_s) * gap /
+                         min(p.length_at(self.lane_mm) for p in pieces) + .35)
+            candidates = []
+            for idx, candidate in enumerate(pieces):
+                direction = 1 if pos.reverse_parsing == candidate.reversed else -1
+                step = ((idx - self.index) * self.direction) % len(pieces)
+                if (candidate.id == pieces[k].id and direction == self.direction
+                        and step <= min(budget, len(pieces) / 2)):
+                    candidates.append((step, idx))
+            if candidates and (1 if pos.reverse_parsing == pieces[k].reversed else -1) != self.direction:
+                k = min(candidates)[1]
         piece = self.track.pieces[k]
         located = locate(pos.piece, pos.location, pos.reverse_parsing)
         self.speed = float(pos.speed_mm_s)
         if located is None:
             # A recognized piece with an unknown location is not a position fix.
             return
+        self._fixed = True
         frac = 1.0 - located[1] if piece.reversed else located[1]
         direction = 1 if pos.reverse_parsing == piece.reversed else -1
         if self.index == k and direction == self.direction:
             next_k = (k + direction) % len(self.track.pieces)
             next_piece = self.track.pieces[next_k]
             wrapped = (self.frac > 0.75 and frac < 0.35) if direction > 0 else (self.frac < 0.25 and frac > 0.65)
-            if (wrapped and next_k != k and next_piece.id == piece.id
-                    and next_piece.reversed == piece.reversed):
+            identical_next = next_k != k and next_piece.id == piece.id and next_piece.reversed == piece.reversed
+            if identical_next and self.filter.position is not None:
+                predicted = self.filter.predict(now)
+                def residual(index):
+                    distance = self.filter.distance(index, frac)
+                    return abs((distance - predicted + self.filter.length / 2) % self.filter.length - self.filter.length / 2)
+                # Sparse packets may report the same barcode on two consecutive
+                # identical pieces, with no observed end-to-start fraction wrap.
+                wrapped |= residual(next_k) + 80 < residual(k)
+            if wrapped and identical_next:
                 # A missed transition between identical adjacent pieces otherwise
                 # leaves _match() stuck on the earlier piece indefinitely.
                 k, piece = next_k, next_piece
@@ -392,11 +458,32 @@ class CarLocalizer:
             self.sub_id = None
         self.frac = frac
         self.lane_mm = lane_car if self.direction > 0 else -lane_car
+        self._code_pose = self.index, self.frac, self.sub_id
 
     def _on_transition(self, _tr: P.TransitionUpdate, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         if self.index is None:
             return
+        if self.filter.position is not None and self.on_track and now - self.filter.last_fix <= self.filter.HORIZON:
+            predicted = self.filter.predict(now)
+            boundaries = [(self.filter.offsets[i], i, 0.0) for i in range(len(self.track.pieces))]
+            boundaries += [(self.filter.distance(i, .5), i, .5)
+                           for i, p in enumerate(self.track.pieces) if p.kind == START]
+            def error(boundary):
+                return abs((boundary[0] - predicted + self.filter.length / 2) % self.filter.length - self.filter.length / 2)
+            boundary = min(boundaries, key=error)
+            if error(boundary) > max(150, self.speed * .12):
+                return  # an ambiguous bar is not a trustworthy position fix
+            _, index, frac = boundary
+            if frac == 0 and self.direction < 0:
+                index, frac = (index - 1) % len(self.track.pieces), 1.0
+            self.index, self.frac = index, frac
+            self.sub_id = ((FINISH_ID if self.direction > 0 else START_ID) if frac == .5 else None)
+            self.last_code_piece = None
+            self.last_update = now
+            self._fixed = True
+            return
+        self._fixed = True
         piece = self.track.pieces[self.index]
         n = len(self.track.pieces)
         if piece.kind == START:
@@ -417,7 +504,33 @@ class CarLocalizer:
         self.last_update = now
 
     # ---- main-thread helpers ----
-    def advance(self, dt: float) -> None:
+    def _publish_progress(self, now: float) -> Optional[float]:
+        """One unwrapped route coordinate for both drawing and race scoring.
+
+        Keep arrival-time samples so a busy frame cannot hide a crossing. A
+        later BLE correction must not undo distance already shown on screen.
+        """
+        if not self.on_track or self.filter.position is None:
+            return None
+        if self._display_time is not None and now <= self._display_time:
+            return self._display_distance
+        projected = self.filter.predict(now)
+        if self._display_distance is not None:
+            projected = (max(projected, self._display_distance) if self.direction > 0
+                         else min(projected, self._display_distance))
+        self._display_distance, self._display_time = projected, now
+        sample_time = min(now, self.filter.last_fix + self.filter.HORIZON)
+        self.motion_samples.append((projected, sample_time, self.route_epoch))
+        return projected
+
+    def advance(self, dt: float, now: Optional[float] = None) -> None:
+        if not self.on_track:
+            return
+        if self.filter.position is not None:
+            self._prediction_t = now if now is not None else self._prediction_t + max(0.0, dt)
+            projected = self._publish_progress(self._prediction_t)
+            self.index, self.frac = self.filter.pose(projected)
+            return
         if self.index is None or self.speed <= 0:
             return
         piece = self.track.pieces[self.index]

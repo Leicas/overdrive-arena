@@ -23,8 +23,15 @@ cars directly, with the protocol verified on real hardware (firmware 11866) and 
   Pads can join or leave while the app runs.
 - **Track scanning**: the cars drive one lap and the loop is rebuilt from the track codes (piece ids, curve
   direction from wheel travel, closure check). Saved as `track.json`.
-- **Live map**: cars drawn on the track with heading, lane, trails and effects, from the cars' own position
-  reports plus dead reckoning in between.
+- **Live map**: a circuit-constrained Kalman position estimate combines measured speed, lane radius and
+  BLE position fixes. Prediction crosses piece boundaries and stops after one second without a fix.
+- **Map records**: best lap and fastest completed race saved in `records.json` and shown on the main
+  screen in ranked car and controller tables. Personal records are saved even when they do not beat the
+  overall map record. Human and AI records, modes, and race lengths are kept separate; car/controller
+  combinations are also retained. Cars use their Bluetooth address. Controller records use model plus
+  player slot (P1/P2/P3), since identical pads do not expose a unique identity through pygame. Keep the
+  same connection order for consistent slots. Existing overall records are retained; historical personal
+  times that were never saved cannot be reconstructed. Long tables rotate pages every seven seconds.
 - **Starting grid**: every car drives itself to the start line in its own lane and stops on the finish-line
   bar; 3-2-1-GO releases them together.
 - **Two modes**: BATTLE (blasters, mines, HP, kills) or RACE (laps only, first to N laps wins).
@@ -46,6 +53,8 @@ python -m venv .venv
 ```
 
 Cars must be powered on. Turn controllers on before starting (or later, they hot-plug).
+Gamepads continue working when the window loses focus; keyboard controls require focus.
+Controllers pulse on **3, 2, 1**, with a stronger pulse at **GO**.
 
 ## How to play
 
@@ -57,8 +66,8 @@ Cars must be powered on. Turn controllers on before starting (or later, they hot
    - **X** (Tab): cycle an unclaimed car through Easy / Normal / Hard / Extreme / Parked (default: Normal).
    - **SCAN TRACK** (Y / T / click): every connected car drives a lap; the first to close the loop provides the
      map. Cars that read no track code within 8 s are flagged "NOT ON THE TRACK". Do this once per layout.
-   - **BATTLE / RACE** (M / stick click / click) picks the mode; the **laps** button cycles 3 / 5 / 10 / 20.
-   - **RACE** (Start / Space / click): enabled with at least one connected player or AI car off its charger. Leave all cars unclaimed for an AI-only race. The controllers legend and
+   - **BATTLE / RACE** (M / left-stick click / click) picks the mode; **D-pad up/down** or the **laps** button selects 3 / 5 / 10 / 20 laps.
+   - **RACE** (Start / Options / Space / click): enabled with at least one connected player or AI car off its charger. Leave all cars unclaimed for an AI-only race. The controllers legend and
      the "players / AI / parked" line tell you who drives what.
 3. **Starting grid**: each participant drives to the start line in its own lane (turning around first if it
    faces the wrong way), crawls the last half piece at 200 mm/s and stops on the finish-line bar. Cars that
@@ -66,6 +75,23 @@ Cars must be powered on. Turn controllers on before starting (or later, they hot
    attempts they stop and are left out. Cars that read no codes within 12 s, or sit on their charger,
    are left out. Then **3-2-1-GO**.
 4. **Race**. **Back** (Esc) stops everything and returns to pairing. **F11** toggles fullscreen.
+   After a finish, **Start / Options** starts another grid and countdown with the same selections.
+   Replace an off-track car, then press **right-stick / R3 / R**, or click **RECOVER**. The controller
+   retries its player's car plus waiting AI; the on-screen button retries all waiting cars. Each search
+   is limited to 1.5 seconds at up to 250 mm/s. Brake or emergency stop cancels a player's search.
+
+BLE notifications are timestamped on arrival, before parsing or queueing. Position fixes are applied at
+that time and projected to the current frame; older out-of-order motion updates are ignored. Delayed
+forward corrections hold the displayed car briefly instead of animating it backwards. The firmware's
+position packet has no device timestamp, so this compensates app queue delays, not radio transit time.
+
+The map and lap counter share one continuous, unwrapped route estimate. Every update and frame prediction
+is kept in timestamp order, so a forward circuit shown by the estimate completes a lap even if the finish
+codes were missed or several updates arrived between frames. Crossing times are interpolated along the
+track geometry. BLE corrections cannot subtract distance already displayed or count a finish twice.
+Prediction freezes after one second without a fix; silence holds progress instead of erasing it or
+inventing more laps. Reversal, explicit off-track reports and recovery reset the partial lap. The HUD
+shows current-lap progress and reset reasons. A complete forward circuit is required for a timed lap.
 
 | Action              | Xbox            | PS5           | Keyboard          |
 |---------------------|-----------------|---------------|-------------------|
@@ -76,7 +102,7 @@ Cars must be powered on. Turn controllers on before starting (or later, they hot
 | Drop mine           | Y               | Triangle      | G                 |
 | U-turn              | A               | Cross         | U                 |
 | Straight boost      | Left stick click | L3           | Left Shift        |
-| Retry AI recovery   | Right stick click | R3          | R                 |
+| Retry recovery      | Right stick click | R3          | R                 |
 | Emergency stop      | B               | Circle        | Space             |
 | Speed limit +/- 100 | D-pad up/down   | D-pad up/down | + / -             |
 | Back / quit         | View            | Share         | Esc               |

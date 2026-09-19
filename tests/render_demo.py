@@ -91,6 +91,14 @@ def main(out_dir: Path):
     pygame.image.save(screen, str(out_dir / "render_countdown.png"))
     game.phase = "race"
     game.mode = "race"; game.lap_target = 5
+    # Synthetic records for visual QA only; Game's default store is in-memory.
+    for i, c in enumerate(cars):
+        c.car.address = f"demo-car-{i}"
+        pad = Keyboard()
+        pad.short, pad.name, pad.record_id = f"P{i + 1}", "Wireless Controller", f"demo:{i}"
+        c.source = pad
+        game.records.record(track, "race", c, "lap", 6.98 + i * .63)
+        game.records.record(track, "race", c, "race", 38.24 + i * 2.61, 5)
     r.draw_race(game, "controls line 1\ncontrols line 2")
     pygame.image.save(screen, str(out_dir / "render_racemode.png"))
     r.draw_pairing(game, [kb], {kb: 1}, {}, "RACE mode: laps only, weapons off", "controls")
